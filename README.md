@@ -4,7 +4,7 @@
 ![License](https://img.shields.io/badge/license-GPL%20v3-blue)
 ![Language](https://img.shields.io/badge/language-Rust-orange)
 
-A modern, lightweight, and memory-safe HTTP/HTTPS proxy written in Rust. This project is a complete rewrite of the classic [tinyproxy](https://github.com/tinyproxy/tinyproxy), rewritten in rust.
+A modern, lightweight, and memory-safe HTTP/HTTPS proxy written in Rust. This project is a complete rewrite of the classic [tinyproxy](https://github.com/tinyproxy/tinyproxy).
 
 ## 📋 Implementation Status
 
