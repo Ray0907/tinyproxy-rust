@@ -1,153 +1,190 @@
 # Tinyproxy-Rust
 
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
-![License](https://img.shields.io/badge/license-GPL%20v3-blue)
-![Language](https://img.shields.io/badge/language-Rust-orange)
+[![CI](https://github.com/Ray0907/tinyproxy-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/Ray0907/tinyproxy-rust/actions/workflows/ci.yml)
 
-A modern, lightweight, and memory-safe HTTP/HTTPS proxy written in Rust. This project is a complete rewrite of the classic [tinyproxy](https://github.com/tinyproxy/tinyproxy).
+A small HTTP/1 forward proxy and HTTPS CONNECT tunnel, written in Rust.
 
-## 📋 Implementation Status
+The hardening implementation uses Hyper for HTTP message parsing and streaming,
+and Tokio for TCP tunnels. It is **not a complete drop-in replacement** for C
+Tinyproxy. Unsupported directives fail at startup instead of being silently
+accepted. This project has not yet demonstrated a performance advantage over C
+Tinyproxy; the included Criterion benchmarks are microbenchmarks, not proxy
+throughput comparisons.
 
-This Rust implementation addresses many of the TODO items from the [original tinyproxy TODO list](https://github.com/tinyproxy/tinyproxy/blob/master/TODO):
-
-### ✅ **Fully Implemented**
-
-- **✅ Modular Proxy Architecture**: Complete modular design with separate modules for different proxy types (HTTP, filtering, authentication, ACL)
-- **✅ User Authentication**: Full HTTP Basic authentication support with configurable username/password pairs (`src/auth.rs`)
-- **✅ Consistent Error Logging**: Modern structured logging using `log` and `thiserror` crates with unified error handling (`src/error.rs`)
-- **✅ Memory Debugging Removal**: Rust's ownership system eliminates memory leaks by design, no manual memory management needed
-- **✅ Single Return Point Functions**: Rust's `Result<T>` type enforces consistent error handling patterns
-- **✅ Header Order Issues**: N/A for Rust (this was a C-specific problem with `common.h`)
-
-### 🔶 **Partially Implemented**
-
-- **🔶 Request Rewriting**: Basic URL handling exists, but lacks full RegEx rewriting capabilities
-- **🔶 External Filtering**: Built-in filtering system with regex/domain/exact matching (`src/filter.rs`), but no external program filtering
-- **🔶 Header Rewriting**: Basic header processing with support for anonymous headers, Via headers, and custom headers, but lacks full bidirectional rewriting
-
-### ❌ **Not Yet Implemented**
-
-- **❌ chroot() Jailing**: Security sandboxing feature not implemented
-- **❌ External Data Filtering**: Ability to pipe connection data through external filtering programs
-
-### 🚀 **Rust-Specific Improvements**
-
-Beyond the original TODO list, this implementation provides:
-
-- **Async/Await Architecture**: High-performance concurrent connection handling with tokio
-- **Type Safety**: Compile-time prevention of common programming errors
-- **Comprehensive Statistics**: Detailed connection, request, and authentication metrics (`src/stats.rs`)
-- **Modern Configuration**: Flexible configuration parsing with multiple format support
-- **Complete Test Coverage**: Unit tests and benchmarks for reliability
-
-## 📦 Getting Started
-
-### Prerequisites
-
-- **Rust:** Ensure you have the Rust toolchain installed. You can get it from [rustup.rs](https://rustup.rs/).
-- **k6:** For running the performance benchmarks. ([Install k6](https://k6.io/docs/getting-started/installation/))
-- **Original Tinyproxy:** For performance comparison. (e.g., `brew install tinyproxy` on macOS).
-
-### Installation & Building
-
-- **Build the release binary:**
-  ```sh
-  cargo build --release
-  ```
-  The executable will be located at `target/release/tinyproxy-rust`.
-
-## ⚙️ Usage
-
-1.  **Create a configuration file** (e.g., `config.toml`):
-
-    ```toml
-    # The address to bind to.
-    Listen = "0.0.0.0"
-
-    # The port to listen on.
-    Port = 8888
-
-    # Number of worker threads to use.
-    Threads = 4
-
-    # Log level (Error, Warn, Info, Debug, Trace)
-    LogLevel = "Info"
-
-    # Path to the PID file.
-    PidFile = "/tmp/tinyproxy-rust.pid"
-    ```
-
-2.  **Run the proxy:**
-
-    ```sh
-    ./target/release/tinyproxy -c config.toml
-    ```
-
-3.  **Test the connection:**
-    ```sh
-    curl -x http://127.0.0.1:8888 http://httpbin.org/ip
-    ```
-
-## 🔧 Configuration
-
-The proxy supports the same configuration format as the original tinyproxy. See `config/tinyproxy-rust.conf` for a full example with all available options.
-
-Key configuration options include:
-
-- **Port**: Listen port (default: 8888)
-- **User/Group**: Process user/group
-- **MaxClients**: Maximum concurrent connections
-- **BasicAuth**: HTTP Basic authentication
-- **Allow/Deny**: Access control rules
-- **Filter**: URL/domain filtering
-- **Upstream**: Upstream proxy configuration
-- **ConnectPort**: Allowed CONNECT ports
-
-## 📊 Performance & Benchmarks
-
-Run the included benchmarks to compare performance:
+## Build and run
 
 ```sh
-cargo bench
+cargo build --release --locked
+./target/release/tinyproxy-rust --check -c config/tinyproxy-rust.conf
+./target/release/tinyproxy-rust -c config/tinyproxy-rust.conf
 ```
 
-The Rust implementation typically shows significant performance improvements over the original C version, especially under high concurrency loads, while maintaining memory safety.
+In another terminal:
 
-## 🤝 Contributing
+```sh
+curl --proxy http://127.0.0.1:8888 http://example.com/
+curl --proxy http://127.0.0.1:8888 https://example.com/
+```
 
-We welcome contributions! Here are some areas where help is needed:
+The binary stays in the foreground. `-d` / `--foreground` explicitly selects the
+same behavior. `--debug` initializes the logger once. `-v` / `--version` displays
+the package version. An unreadable or missing configuration is an error, not a
+request to start an unauthenticated listener with defaults.
 
-### High Priority TODOs
+Run as an unprivileged user under a service manager. SIGINT and, on Unix,
+SIGTERM stop new accepts, drain active work, and force-close remaining sockets
+after `ShutdownTimeout`. This implementation does not fork, change users,
+write PID files, or implement chroot. Existing configurations containing those
+directives must be migrated explicitly.
 
-- [ ] **chroot/Sandboxing Support**: Implement container-based or chroot jailing for enhanced security
-- [ ] **Advanced Request Rewriting**: Add full RegEx-based URL rewriting capabilities
-- [ ] **External Filter Programs**: Support piping data through external filtering applications
+## Minimal configuration
 
-### Medium Priority
+The syntax is Tinyproxy-style key/value lines, **not TOML**. Quoted values and
+comments beginning with `#` at a token boundary are supported.
 
-- [ ] **Enhanced Header Rewriting**: Complete bidirectional request/response header manipulation
-- [ ] **Performance Optimizations**: Further async improvements and connection pooling
-- [ ] **Additional Proxy Types**: SOCKS5, FTP proxy support
+```conf
+Listen 127.0.0.1
+Port 8888
+MaxClients 100
+Timeout 600
+HeaderTimeout 30
+ConnectTimeout 30
+ShutdownTimeout 5
+ConnectPort 443
+LogLevel Info
+```
 
-Please feel free to open issues or submit pull requests!
+The default listener is loopback only. Listening on a non-loopback address
+requires explicit ACL rules or BasicAuth. `Allow all` is an explicit public
+access choice; do not use it on an Internet-accessible unauthenticated proxy.
+`Bind` sets the **outgoing** source IP and never changes the listener.
 
----
+Authentication can contain multiple users:
 
----
+```conf
+BasicAuth alice "a password with spaces"
+BasicAuth bob another-password
+```
 
-## 📝 Original TODO List Implementation Status
+The old Rust `BasicAuth user:password` syntax is also accepted. Missing fields,
+empty credentials, duplicate usernames, and malformed lines are rejected.
+Configuration errors include line numbers without printing credential values.
 
-Below is a detailed mapping of the [original tinyproxy TODO items](https://github.com/tinyproxy/tinyproxy/blob/master/TODO) and their implementation status in this Rust version:
+**Basic authentication does not encrypt the client-to-proxy hop.** Use it only
+on a trusted network or through an independently protected transport. HTTPS
+through CONNECT protects the destination TLS session; it does not turn this
+proxy's listening socket into a TLS listener.
 
-| Original TODO Item                                | Status          | Implementation Details                                                                    |
-| ------------------------------------------------- | --------------- | ----------------------------------------------------------------------------------------- |
-| **Modular proxy hooks for different proxy types** | ✅ **Complete** | Fully modular architecture with separate modules (`auth.rs`, `filter.rs`, `acl.rs`, etc.) |
-| **Function to rewrite incoming requests**         | 🔶 **Partial**  | Basic URL handling implemented, RegEx rewriting needs enhancement                         |
-| **External filtering program support**            | ❌ **Pending**  | Built-in filtering exists, but external program piping not implemented                    |
-| **Bidirectional header rewriting**                | 🔶 **Partial**  | Basic header manipulation available, full bidirectional rewriting needed                  |
-| **chroot() jailing option**                       | ❌ **Pending**  | Critical security feature, high priority for implementation                               |
-| **Consistent error logging**                      | ✅ **Complete** | Modern structured logging with `log` crate and unified error handling                     |
-| **User authentication**                           | ✅ **Complete** | Full HTTP Basic auth with configurable credentials and realm                              |
-| **Remove common.h and fix headers**               | ✅ **N/A**      | C-specific issue, not applicable to Rust implementation                                   |
-| **Remove memory debugging functions**             | ✅ **Complete** | Rust's ownership system eliminates need for manual memory management                      |
-| **Single return point functions**                 | ✅ **Complete** | Rust's `Result<T>` pattern enforces consistent error handling                             |
+## Supported configuration and compatibility
+
+| Directives | Behavior |
+| --- | --- |
+| `Listen`, `Port` | Repeatable listening addresses; loopback by default. Port 0 is useful for embedded tests. |
+| `Bind` | Outbound source IP, including address-family matching. |
+| `Allow`, `Deny` | IP/CIDR, `all`, or `*`. First matching rule wins; unmatched clients are denied when any rules exist. Hostname ACLs are not supported. IPv4-mapped clients are normalized. |
+| `BasicAuth` | Multiple username/password pairs; checked on every HTTP request. |
+| `ConnectPort` | First explicit directive replaces defaults `[443, 563]`; repeat to add ports. A lone `ConnectPort 0` disables CONNECT. Mixing 0 and real ports is an error. |
+| `Timeout` | Idle timeout in seconds, reset by actual I/O progress in either direction; not a maximum tunnel lifetime. |
+| `HeaderTimeout` | Total time to receive a request header, in seconds; trickling bytes does not reset it. |
+| `ConnectTimeout` | Combined DNS resolution and TCP connect deadline, in seconds. |
+| `ShutdownTimeout` | Grace period before remaining connections are force-closed. |
+| `MaxClients` | Connection limit, retained for the full CONNECT tunnel lifetime. |
+| `Filter`, `FilterURLs`, `FilterExtended`, `FilterCaseSensitive`, `FilterDefaultDeny` | See filtering below. |
+| `ViaProxyName`, `DisableViaHeader` | Append the proxy's Via value, preserving prior Via entries, unless disabled. |
+| `StatHost` | Exact destination-host match for an authenticated GET/HEAD HTML statistics page. |
+| `LogLevel` | Rust log levels such as Error, Warn, Info, Debug, Trace, and Off. |
+
+All other directives are rejected. In particular, upstream proxy chaining,
+reverse/transparent modes, `Anonymous`, `AddHeader`, custom error pages,
+`User`/`Group`, `PidFile`, `LogFile`/`Syslog`, and legacy child-process settings
+are **not implemented**. Previous helper functions and configuration fields
+that did not participate in actual forwarding have been removed rather than
+advertised as working features.
+
+### Filtering
+
+```conf
+Filter "blocked-domains.txt"
+FilterURLs No
+FilterExtended No
+FilterCaseSensitive No
+```
+
+Relative filter paths resolve against the configuration's directory. Policies
+are loaded and compiled once before sockets are bound. Missing files and invalid
+regular expressions are startup errors; invalid expressions are not converted
+to permissive literal rules. Changes require a restart; hot reload is not yet
+implemented.
+
+With `FilterURLs No`, filtering still operates, but uses the destination host.
+With `FilterExtended No`, lines such as `example.com` or `.example.com` match
+the domain and its subdomains, not `notexample.com` or `example.com.evil.test`.
+With `FilterURLs Yes`, literal rules are substring matches against the HTTP URL.
+`FilterExtended Yes` selects Rust regular expressions; this is **not POSIX BRE/ERE
+syntax compatibility**. `FilterDefaultDeny Yes` makes matching rules an allowlist.
+By default, matching rules are blocked.
+
+CONNECT is always filtered by its authority host, never by an imagined HTTPS
+URL path. The encrypted request contents are not inspected.
+
+## HTTP and connection behavior
+
+HTTP requests are parsed and forwarded individually, including successive
+requests to different origins over one client connection. Bodies remain
+streaming. Direct-origin requests use origin-form paths with a Host header
+derived from the chosen authority. Absolute `https://` forwarding is rejected;
+clients must use CONNECT rather than accidentally sending plaintext to a TLS
+port. HTTP Upgrade/WebSocket forwarding is not yet supported.
+
+Proxy credentials and hop-by-hop headers are consumed at the proxy boundary;
+ordinary origin `Authorization`, multiple `Set-Cookie` fields, and end-to-end
+headers are preserved. Hyper owns body framing instead of converting all
+headers into a single-value string map. Request headers are bounded by a 16 KiB
+connection buffer and a total read deadline.
+
+CONNECT uses Tokio's bidirectional copy, including half-close handling and
+bytes buffered beyond the initial CONNECT header. HTTP connections, upstream
+drivers, and upgraded tunnels are tracked during shutdown. Counters use atomics;
+wire-byte counters refer to the client-facing socket, including HTTP headers,
+not solely response payloads.
+
+## Verification
+
+```sh
+cargo fmt --all -- --check
+cargo test --all-targets --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo build --release --locked
+cargo bench --locked
+```
+
+Regression tests use local sockets and ephemeral ports, not public Internet
+endpoints. They cover configuration failure modes, credentials and hop-by-hop
+headers, repeated requests, origin selection, domain filters, chunked and large
+uploads, Expect/100-continue, conflicting Content-Length values, early CONNECT
+data, half-close, connection limits, slow headers, and shutdown.
+
+A passing test suite is not a comprehensive security audit or evidence that
+all HTTP edge cases are covered. Cross-implementation differential tests,
+fuzzing, prolonged load tests, and controlled end-to-end performance comparisons
+remain follow-up work.
+
+## Security boundaries and remaining work
+
+This is a trusted-client forward proxy, not a sandbox or a complete SSRF/DLP
+boundary. Client ACLs constrain who connects; they do not restrict resolved
+destination IPs. Allowed clients can reach private/loopback destinations and
+allowed CONNECT ports unless separately restricted by the network. DNS rebinding
+protection, destination-IP policy, TLS listeners, rate limiting, and constant-time
+authentication are not provided by this revision. Setting a proxy environment
+variable also does not force an untrusted program to use the proxy.
+
+Next priorities are end-to-end benchmarks against pinned C Tinyproxy versions,
+additional protocol/adversarial tests, measured HTTP connection pooling,
+transactional policy reload, and simpler deployment packages. No external service
+or database is required by the current executable.
+
+## License
+
+GPL-3.0. See [LICENSE](LICENSE). Original project:
+[tinyproxy/tinyproxy](https://github.com/tinyproxy/tinyproxy).

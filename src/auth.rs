@@ -40,6 +40,6 @@ impl Authenticator {
         };
         // Credentials are never logged or forwarded. This is not a claim of
         // constant-time authentication; rate limiting is a separate follow-up.
-        self.credentials.iter().any(|expected| *expected == decoded)
+        self.credentials.contains(&decoded)
     }
 }

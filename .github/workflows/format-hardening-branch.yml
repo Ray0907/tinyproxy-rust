@@ -1,4 +1,4 @@
-# Temporary branch-only maintenance; removed before this PR is ready.
+# Temporary branch-only maintenance; final test additions, then remove this file.
 name: Format hardening branch
 on:
   push:
@@ -18,12 +18,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - name: Format only Rust sources and generate the application lockfile
+      - name: Format only Rust sources and retain the application lockfile
         run: |
           cargo fmt --all
-          cargo generate-lockfile
           git add src benches tests
-          git add -f Cargo.lock
           if git diff --cached --quiet; then exit 0; fi
-          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'style: format Rust sources and pin application dependencies'
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' commit -m 'style: format additional tunnel regression tests'
           git push origin HEAD:refs/heads/fix/proxy-core-hardening

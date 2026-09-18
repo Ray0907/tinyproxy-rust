@@ -33,6 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo test --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --release
+      - run: cargo test --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo build --release --locked
+      - run: ./target/release/tinyproxy-rust --check -c config/tinyproxy-rust.conf
