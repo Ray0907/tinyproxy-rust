@@ -111,7 +111,7 @@ async fn ipv6_authorities_work_for_http_and_connect() -> Result<()> {
         drop(stream);
         let (mut stream, _) = listener.accept().await?;
         assert_eq!(stream.read_u8().await?, b'a');
-        stream.write_all(b'b').await?;
+        stream.write_all(b"b").await?;
         Ok::<_, anyhow::Error>(())
     });
     let proxy = ProxyServer::bind(configuration(destination.port())).await?;
