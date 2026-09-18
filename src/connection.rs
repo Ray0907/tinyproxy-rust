@@ -167,19 +167,22 @@ async fn handle(
             }
             context.cancelled.cancel();
         });
-        return Ok(text_response(StatusCode::OK, String::new(), "text/plain"));
+        let mut response = text_response(StatusCode::OK, String::new(), "text/plain");
+        response.headers_mut().remove("content-length");
+        response.headers_mut().remove("content-type");
+        return Ok(response);
     }
     if request.headers().contains_key("upgrade") {
         return Err((StatusCode::NOT_IMPLEMENTED, "HTTP Upgrade is not supported"));
     }
     strip_hop_by_hop(request.headers_mut())
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let target_stream = dial(&target, runtime).await?;
     request.headers_mut().insert(HOST, target.authority);
     add_via(request.headers_mut(), runtime);
     *request.uri_mut() = target.path;
     *request.version_mut() = Version::HTTP_11;
 
-    let target_stream = dial(&target, runtime).await?;
     let io = TokioIo::new(ActivityIo::new(
         target_stream,
         context.activity.clone(),
@@ -317,6 +320,9 @@ impl Target {
 }
 
 fn strip_hop_by_hop(headers: &mut HeaderMap) -> std::result::Result<(), &'static str> {
+    if headers.contains_key("content-length") && headers.contains_key("transfer-encoding") {
+        return Err("Ambiguous message framing");
+    }
     let mut nominated = Vec::new();
     for value in headers.get_all(CONNECTION) {
         for token in value
