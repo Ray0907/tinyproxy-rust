@@ -75,10 +75,16 @@ async fn active_tunnel_outlives_idle_timeout_in_both_directions() -> Result<()> 
         sleep(Duration::from_millis(250)).await;
         if index % 2 == 0 {
             client.write_all(&[index]).await?;
-            assert_eq!(timeout(Duration::from_secs(2), upstream.read_u8()).await??, index);
+            assert_eq!(
+                timeout(Duration::from_secs(2), upstream.read_u8()).await??,
+                index
+            );
         } else {
             upstream.write_all(&[index]).await?;
-            assert_eq!(timeout(Duration::from_secs(2), client.read_u8()).await??, index);
+            assert_eq!(
+                timeout(Duration::from_secs(2), client.read_u8()).await??,
+                index
+            );
         }
     }
     drop(client);
@@ -96,7 +102,9 @@ async fn ipv6_authorities_work_for_http_and_connect() -> Result<()> {
         let (mut stream, _) = listener.accept().await?;
         let request = header(&mut stream).await?;
         assert!(request.starts_with("GET /ipv6 HTTP/1.1\r\n"));
-        assert!(request.to_ascii_lowercase().contains(&format!("host: {destination}\r\n")));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains(&format!("host: {destination}\r\n")));
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
             .await?;
@@ -120,7 +128,10 @@ async fn ipv6_authorities_work_for_http_and_connect() -> Result<()> {
     drop(client);
     let mut client = tunnel(address, destination).await?;
     client.write_all(b"a").await?;
-    assert_eq!(timeout(Duration::from_secs(2), client.read_u8()).await??, b'b');
+    assert_eq!(
+        timeout(Duration::from_secs(2), client.read_u8()).await??,
+        b'b'
+    );
     timeout(Duration::from_secs(4), origin).await???;
     drop(client);
     shutdown.cancel();
@@ -142,14 +153,20 @@ async fn shutdown_drains_a_tunnel_that_finishes_before_the_deadline() -> Result<
     shutdown.cancel();
     sleep(Duration::from_millis(50)).await;
     client.write_all(b"a").await?;
-    assert_eq!(timeout(Duration::from_secs(2), upstream.read_u8()).await??, b'a');
+    assert_eq!(
+        timeout(Duration::from_secs(2), upstream.read_u8()).await??,
+        b'a'
+    );
     client.shutdown().await?;
     assert!(timeout(Duration::from_secs(2), upstream.read_u8())
         .await?
         .is_err());
     upstream.write_all(b"b").await?;
     upstream.shutdown().await?;
-    assert_eq!(timeout(Duration::from_secs(2), client.read_u8()).await??, b'b');
+    assert_eq!(
+        timeout(Duration::from_secs(2), client.read_u8()).await??,
+        b'b'
+    );
     timeout(Duration::from_secs(4), task).await???;
     assert_eq!(metrics.active.load(Ordering::Relaxed), 0);
     Ok(())
