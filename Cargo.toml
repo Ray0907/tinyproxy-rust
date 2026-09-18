@@ -3,45 +3,30 @@ name = "tinyproxy-rust"
 version = "1.11.0"
 edition = "2021"
 authors = ["Original: Steven Young <sdyoung@miranda.org>", "Rust port: Ray"]
-description = "A fast lightweight HTTP/HTTPS proxy daemon implemented in Rust"
+description = "A lightweight HTTP forward proxy and CONNECT tunnel"
 license = "GPL-3.0"
 repository = "https://github.com/Ray0907/tinyproxy-rust"
 keywords = ["proxy", "http", "https", "server", "networking"]
 categories = ["network-programming", "web-programming"]
 
-[[bin]]
-name = "tinyproxy-rust"
-path = "src/main.rs"
-
 [dependencies]
-tokio = { version = "1.0", features = ["full"] }
-tokio-native-tls = "0.3"
-native-tls = "0.2"
-clap = { version = "4.0", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-toml = "0.8"
+anyhow = "1"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+ipnet = "2"
 log = "0.4"
-env_logger = "0.10"
-regex = "1.5"
-base64 = "0.21"
-url = "2.0"
-anyhow = "1.0"
-thiserror = "1.0"
-bytes = "1.4"
-futures = "0.3"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }
-libc = "0.2"
-nix = { version = "0.27", features = ["process", "fs"] }
-ctrlc = "3.2"
-hyper = { version = "0.14", features = ["full"] }
-hyper-tls = "0.5"
-trust-dns-resolver = "0.23"
+regex = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
-tokio-test = "0.4"
 criterion = "0.5"
+tempfile = "3"
 
 [[bench]]
 name = "proxy_bench"

@@ -1,65 +1,18 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use std::sync::Arc;
-use tinyproxy_rust::config::Config;
-use tinyproxy_rust::utils::{format_bytes, is_valid_hostname};
+use tinyproxy_rust::{acl::AccessControl, config::Config};
 
-fn benchmark_format_bytes(c: &mut Criterion) {
-    c.bench_function("format_bytes", |b| {
-        b.iter(|| {
-            black_box(format_bytes(1048576)); // 1MB
-            black_box(format_bytes(1073741824)); // 1GB
-            black_box(format_bytes(1099511627776)); // 1TB
-        });
-    });
+const CONFIG: &str = "Port 8888\nListen 127.0.0.1\nAllow 127.0.0.0/8\nDeny all\nBasicAuth user pass\nConnectPort 443\n";
+
+fn config_parsing(c: &mut Criterion) {
+    c.bench_function("parse_config", |b| b.iter(|| Config::parse(black_box(CONFIG)).unwrap()));
 }
 
-fn benchmark_hostname_validation(c: &mut Criterion) {
-    let hostnames = vec![
-        "example.com",
-        "sub.example.com",
-        "very-long-subdomain.example.com",
-        "test123.example.com",
-        "invalid..hostname",
-        "-invalid.com",
-    ];
-
-    c.bench_function("hostname_validation", |b| {
-        b.iter(|| {
-            for hostname in &hostnames {
-                black_box(is_valid_hostname(hostname));
-            }
-        });
-    });
+fn acl_lookup(c: &mut Criterion) {
+    let config = Config::parse(CONFIG).unwrap();
+    let acl = AccessControl::new(&config).unwrap();
+    let address = "127.0.0.1".parse().unwrap();
+    c.bench_function("acl_lookup", |b| b.iter(|| acl.is_allowed(black_box(address))));
 }
 
-fn benchmark_config_parsing(c: &mut Criterion) {
-    let config_content = r#"
-Port 8888
-User nobody
-Group nobody
-Timeout 600
-MaxClients 100
-LogFile /var/log/tinyproxy.log
-Allow 192.168.0.0/16
-Allow 10.0.0.0/8
-Deny all
-BasicAuth user:pass
-ConnectPort 443
-ConnectPort 563
-"#;
-
-    c.bench_function("config_parsing", |b| {
-        b.iter(|| {
-            // Note: parse_config is a private method, so we'll benchmark a public operation instead
-            black_box(Config::default());
-        });
-    });
-}
-
-criterion_group!(
-    benches,
-    benchmark_format_bytes,
-    benchmark_hostname_validation,
-    benchmark_config_parsing
-);
+criterion_group!(benches, config_parsing, acl_lookup);
 criterion_main!(benches);

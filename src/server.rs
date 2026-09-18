@@ -1,159 +1,96 @@
 use crate::config::Config;
+use crate::connection;
+use crate::runtime::{ConnectionGuard, Metrics, Runtime};
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{debug, warn};
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock, Semaphore};
-use tokio::time::Duration;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio::time::{sleep, timeout};
+use tokio_util::sync::CancellationToken;
 
-use crate::connection::ConnectionHandler;
-use crate::stats::Stats;
-
-#[derive(Clone)]
 pub struct ProxyServer {
-    config: Arc<Config>,
-    stats: Arc<RwLock<Stats>>,
-    shutdown_tx: mpsc::Sender<()>,
-    shutdown_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<()>>>,
-    connection_semaphore: Arc<Semaphore>,
+    listeners: Vec<TcpListener>,
+    runtime: Arc<Runtime>,
 }
 
 impl ProxyServer {
-    pub async fn new(config: Arc<Config>) -> Result<Self> {
-        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let stats = Arc::new(RwLock::new(Stats::new()));
-        let connection_semaphore = Arc::new(Semaphore::new(config.max_clients));
-
-        Ok(Self {
-            config,
-            stats,
-            shutdown_tx,
-            shutdown_rx: Arc::new(tokio::sync::Mutex::new(shutdown_rx)),
-            connection_semaphore,
-        })
-    }
-
-    pub async fn run(&self) -> Result<()> {
-        let addresses = self.config.get_listen_addresses();
+    /// Bind only after all policy files and rules have been validated.
+    pub async fn bind(config: Config) -> Result<Self> {
+        let runtime = Arc::new(Runtime::new(config)?);
         let mut listeners = Vec::new();
-
-        // Bind to all specified addresses
-        for addr in addresses {
-            match TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    info!("Listening on {}", addr);
-                    listeners.push(listener);
-                }
-                Err(e) => {
-                    error!("Failed to bind to {}: {}", addr, e);
-                    return Err(e.into());
-                }
-            }
+        for address in &runtime.config.listen_addresses {
+            listeners.push(TcpListener::bind(SocketAddr::new(*address, runtime.config.port)).await?);
         }
-
-        if listeners.is_empty() {
-            return Err(anyhow::anyhow!("No listeners could be created"));
-        }
-
-        // Start the accept loop for each listener
-        let mut tasks = Vec::new();
-
-        for listener in listeners {
-            let server = self.clone();
-            let task = tokio::spawn(async move {
-                server.accept_loop(listener).await;
-            });
-            tasks.push(task);
-        }
-
-        // Wait for shutdown signal
-        let mut shutdown_rx = self.shutdown_rx.lock().await;
-        shutdown_rx.recv().await;
-
-        info!("Shutdown signal received, waiting for connections to close...");
-
-        // Cancel all accept loops
-        for task in tasks {
-            task.abort();
-        }
-
-        // Wait a bit for existing connections to finish
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        info!("Server shutdown complete");
-        Ok(())
+        Ok(Self { listeners, runtime })
     }
 
-    async fn accept_loop(&self, listener: TcpListener) {
-        loop {
-            match listener.accept().await {
-                Ok((stream, addr)) => {
-                    debug!("New connection from {}", addr);
+    pub fn local_addresses(&self) -> Result<Vec<SocketAddr>> {
+        self.listeners.iter().map(|listener| listener.local_addr().map_err(Into::into)).collect()
+    }
 
-                    // Check if we can accept more connections
-                    let permit = match self.connection_semaphore.clone().try_acquire_owned() {
-                        Ok(permit) => permit,
-                        Err(_) => {
-                            warn!(
-                                "Connection limit reached, rejecting connection from {}",
-                                addr
-                            );
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.runtime.shutdown.clone()
+    }
+
+    pub fn metrics(&self) -> Arc<Metrics> {
+        self.runtime.metrics.clone()
+    }
+
+    pub async fn run(self) -> Result<()> {
+        let runtime = self.runtime;
+        let semaphore = Arc::new(Semaphore::new(runtime.config.max_clients));
+        let mut acceptors = JoinSet::new();
+        for listener in self.listeners {
+            let runtime = runtime.clone();
+            let semaphore = semaphore.clone();
+            acceptors.spawn(async move {
+                loop {
+                    let accepted = tokio::select! {
+                        biased;
+                        _ = runtime.shutdown.cancelled() => break,
+                        result = listener.accept() => result,
+                    };
+                    let (stream, address) = match accepted {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            warn!("Accept failed: {}", error.kind());
+                            tokio::select! {
+                                _ = runtime.shutdown.cancelled() => break,
+                                _ = sleep(Duration::from_millis(100)) => {},
+                            }
                             continue;
                         }
                     };
-
-                    // Update connection stats
-                    {
-                        let mut stats = self.stats.write().await;
-                        stats.connections_opened += 1;
-                        stats.active_connections += 1;
-                    }
-
-                    // Spawn a task to handle the connection
-                    let handler = ConnectionHandler::new(
-                        stream,
-                        addr,
-                        self.config.clone(),
-                        self.stats.clone(),
-                    );
-
-                    let stats_clone = self.stats.clone();
-                    tokio::spawn(async move {
-                        let start_time = Instant::now();
-
-                        if let Err(e) = handler.handle().await {
-                            error!("Connection handler error: {}", e);
+                    let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                        runtime.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                        drop(stream);
+                        continue;
+                    };
+                    let guard = Arc::new(ConnectionGuard::new(permit, runtime.metrics.clone()));
+                    let connection_runtime = runtime.clone();
+                    runtime.tasks.spawn(async move {
+                        if connection::serve(stream, address, connection_runtime, guard).await.is_err() {
+                            // Do not log raw requests, URLs, headers, or credentials.
+                            debug!("Client connection ended with a protocol or I/O error");
                         }
-
-                        // Update stats when connection is closed
-                        {
-                            let mut stats = stats_clone.write().await;
-                            stats.active_connections -= 1;
-                            stats.connections_closed += 1;
-                            stats.total_connection_time += start_time.elapsed();
-                        }
-
-                        // Release the connection permit
-                        drop(permit);
                     });
                 }
-                Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                    // Brief pause to avoid busy loop on persistent accept errors
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
+            });
         }
-    }
-
-    pub async fn shutdown(&self) {
-        info!("Initiating server shutdown...");
-        let _ = self.shutdown_tx.send(()).await;
-    }
-
-    pub async fn get_stats(&self) -> Stats {
-        let stats = self.stats.read().await;
-        stats.clone()
+        runtime.shutdown.cancelled().await;
+        while let Some(result) = acceptors.join_next().await {
+            result?;
+        }
+        runtime.tasks.close();
+        if timeout(Duration::from_secs(runtime.config.shutdown_timeout), runtime.tasks.wait()).await.is_err() {
+            runtime.force_shutdown.cancel();
+            runtime.tasks.wait().await;
+        }
+        Ok(())
     }
 }
