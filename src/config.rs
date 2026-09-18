@@ -115,10 +115,15 @@ impl Config {
                         "Invalid BasicAuth credentials"
                     );
                     ensure!(
-                        !config.basic_auth.iter().any(|auth| auth.username == username),
+                        !config
+                            .basic_auth
+                            .iter()
+                            .any(|auth| auth.username == username),
                         "Duplicate BasicAuth username"
                     );
-                    config.basic_auth.push(BasicAuthConfig { username, password });
+                    config
+                        .basic_auth
+                        .push(BasicAuthConfig { username, password });
                     return Ok(());
                 }
                 ensure!(args.len() == 2, "{} requires one value", args[0]);
@@ -144,7 +149,8 @@ impl Config {
                         config.connect_timeout = value.parse().context("Invalid ConnectTimeout")?;
                     }
                     "shutdowntimeout" => {
-                        config.shutdown_timeout = value.parse().context("Invalid ShutdownTimeout")?;
+                        config.shutdown_timeout =
+                            value.parse().context("Invalid ShutdownTimeout")?;
                     }
                     "maxclients" => {
                         config.max_clients = value.parse().context("Invalid MaxClients")?;
@@ -169,7 +175,10 @@ impl Config {
                     "disableviaheader" => config.disable_via_header = parse_bool(value)?,
                     "viaproxyname" => config.via_proxy_name = value.clone(),
                     "stathost" => config.stat_host = Some(value.to_ascii_lowercase()),
-                    _ => bail!("Unsupported directive: {} (see README compatibility table)", args[0]),
+                    _ => bail!(
+                        "Unsupported directive: {} (see README compatibility table)",
+                        args[0]
+                    ),
                 }
                 Ok(())
             };
@@ -177,7 +186,10 @@ impl Config {
                 .with_context(|| format!("Line {}", index + 1))?;
         }
         if config.connect_ports.contains(&0) {
-            ensure!(config.connect_ports.len() == 1, "ConnectPort 0 cannot be combined with other ports");
+            ensure!(
+                config.connect_ports.len() == 1,
+                "ConnectPort 0 cannot be combined with other ports"
+            );
             config.connect_ports.clear();
         }
         config.validate()?;
@@ -185,12 +197,23 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.listen_addresses.is_empty(), "At least one Listen address is required");
-        ensure!(self.max_clients > 0 && self.max_clients <= 1_000_000, "MaxClients must be in 1..=1000000");
         ensure!(
-            [self.timeout, self.header_timeout, self.connect_timeout, self.shutdown_timeout]
-                .iter()
-                .all(|seconds| (1..=86400).contains(seconds)),
+            !self.listen_addresses.is_empty(),
+            "At least one Listen address is required"
+        );
+        ensure!(
+            self.max_clients > 0 && self.max_clients <= 1_000_000,
+            "MaxClients must be in 1..=1000000"
+        );
+        ensure!(
+            [
+                self.timeout,
+                self.header_timeout,
+                self.connect_timeout,
+                self.shutdown_timeout
+            ]
+            .iter()
+            .all(|seconds| (1..=86400).contains(seconds)),
             "Timeouts must be in 1..=86400 seconds"
         );
         ensure!(
@@ -201,12 +224,23 @@ impl Config {
         );
         ensure!(
             !self.via_proxy_name.is_empty()
-                && self.via_proxy_name.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
+                && self
+                    .via_proxy_name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)),
             "ViaProxyName must contain only letters, digits, dots, underscores or hyphens"
         );
-        self.log_level.parse::<log::LevelFilter>().context("Invalid LogLevel")?;
-        ensure!(!self.filter_default_deny || self.filter_file.is_some(), "FilterDefaultDeny requires Filter");
-        ensure!(!self.connect_ports.contains(&0), "Use an empty port list to disable CONNECT in the library API");
+        self.log_level
+            .parse::<log::LevelFilter>()
+            .context("Invalid LogLevel")?;
+        ensure!(
+            !self.filter_default_deny || self.filter_file.is_some(),
+            "FilterDefaultDeny requires Filter"
+        );
+        ensure!(
+            !self.connect_ports.contains(&0),
+            "Use an empty port list to disable CONNECT in the library API"
+        );
         Ok(())
     }
 }
@@ -229,7 +263,11 @@ fn tokenize(line: &str) -> Result<Vec<String>> {
         if let Some(delimiter) = quote {
             if c == delimiter {
                 quote = None;
-            } else if c == '\\' && chars.peek().is_some_and(|next| *next == delimiter || *next == '\\') {
+            } else if c == '\\'
+                && chars
+                    .peek()
+                    .is_some_and(|next| *next == delimiter || *next == '\\')
+            {
                 word.push(chars.next().expect("peeked character"));
             } else {
                 word.push(c);

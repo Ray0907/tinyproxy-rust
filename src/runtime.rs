@@ -77,7 +77,11 @@ impl ConnectionGuard {
     pub fn new(permit: OwnedSemaphorePermit, metrics: Arc<Metrics>) -> Self {
         metrics.opened.fetch_add(1, Ordering::Relaxed);
         metrics.active.fetch_add(1, Ordering::Relaxed);
-        Self { _permit: permit, metrics, _started: Instant::now() }
+        Self {
+            _permit: permit,
+            metrics,
+            _started: Instant::now(),
+        }
     }
 }
 

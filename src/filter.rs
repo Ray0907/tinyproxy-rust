@@ -39,7 +39,9 @@ impl Filter {
                             .case_insensitive(!config.filter_casesensitive)
                             .size_limit(1 << 20)
                             .build()
-                            .with_context(|| format!("Invalid regex at filter line {}", index + 1))?,
+                            .with_context(|| {
+                                format!("Invalid regex at filter line {}", index + 1)
+                            })?,
                     )
                 } else {
                     Rule::Literal(if config.filter_casesensitive {
@@ -60,7 +62,11 @@ impl Filter {
             return true;
         }
         let match_url = self.urls && !connect;
-        let target = if match_url { url } else { host.trim_end_matches('.') };
+        let target = if match_url {
+            url
+        } else {
+            host.trim_end_matches('.')
+        };
         let target = if self.case_sensitive {
             target.to_owned()
         } else {
@@ -72,10 +78,16 @@ impl Filter {
             Rule::Literal(pattern) => {
                 let domain = pattern.trim_start_matches('.').trim_end_matches('.');
                 target == domain
-                    || target.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.'))
+                    || target
+                        .strip_suffix(domain)
+                        .is_some_and(|prefix| prefix.ends_with('.'))
             }
         });
-        if self.default_deny { matched } else { !matched }
+        if self.default_deny {
+            matched
+        } else {
+            !matched
+        }
     }
 
     pub fn rule_count(&self) -> usize {

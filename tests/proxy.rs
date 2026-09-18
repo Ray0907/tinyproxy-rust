@@ -11,7 +11,11 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
-use tinyproxy_rust::{config::{BasicAuthConfig, Config}, runtime::Metrics, server::ProxyServer};
+use tinyproxy_rust::{
+    config::{BasicAuthConfig, Config},
+    runtime::Metrics,
+    server::ProxyServer,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -31,7 +35,12 @@ impl Running {
         let address = server.local_addresses()?[0];
         let shutdown = server.shutdown_token();
         let metrics = server.metrics();
-        Ok(Self { address, shutdown, task: tokio::spawn(server.run()), metrics })
+        Ok(Self {
+            address,
+            shutdown,
+            task: tokio::spawn(server.run()),
+            metrics,
+        })
     }
 
     async fn stop(self) -> Result<()> {
@@ -42,7 +51,14 @@ impl Running {
 }
 
 fn config() -> Config {
-    Config { port: 0, timeout: 3, header_timeout: 2, connect_timeout: 2, shutdown_timeout: 1, ..Config::default() }
+    Config {
+        port: 0,
+        timeout: 3,
+        header_timeout: 2,
+        connect_timeout: 2,
+        shutdown_timeout: 1,
+        ..Config::default()
+    }
 }
 
 async fn read_header(stream: &mut TcpStream) -> Result<String> {
@@ -51,18 +67,26 @@ async fn read_header(stream: &mut TcpStream) -> Result<String> {
         while !bytes.ends_with(b"\r\n\r\n") {
             let byte = stream.read_u8().await?;
             bytes.push(byte);
-            if bytes.len() > 65536 { bail!("test header exceeded limit"); }
+            if bytes.len() > 65536 {
+                bail!("test header exceeded limit");
+            }
         }
         Ok(String::from_utf8(bytes)?)
-    }).await?
+    })
+    .await?
 }
 
 async fn read_response(stream: &mut TcpStream) -> Result<(String, Vec<u8>)> {
     let header = read_header(stream).await?;
-    let length = header.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
-    }).unwrap_or(0);
+    let length = header
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
     let mut body = vec![0; length];
     timeout(Duration::from_secs(4), stream.read_exact(&mut body)).await??;
     Ok((header, body))
@@ -88,10 +112,14 @@ async fn echo_origin() -> Result<(SocketAddr, JoinHandle<Result<()>>)> {
         hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
             .keep_alive(false)
-            .serve_connection(TokioIo::new(stream), service_fn(|request: Request<Incoming>| async move {
-                let bytes = request.into_body().collect().await?.to_bytes();
-                Ok::<_, hyper::Error>(Response::new(Full::<Bytes>::new(bytes)))
-            })).await?;
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(|request: Request<Incoming>| async move {
+                    let bytes = request.into_body().collect().await?.to_bytes();
+                    Ok::<_, hyper::Error>(Response::new(Full::<Bytes>::new(bytes)))
+                }),
+            )
+            .await?;
         Ok(())
     });
     Ok((address, task))
@@ -101,7 +129,10 @@ async fn echo_origin() -> Result<(SocketAddr, JoinHandle<Result<()>>)> {
 async fn credentials_and_hop_headers_are_not_forwarded_but_origin_auth_is() -> Result<()> {
     let (destination, origin_task) = origin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: X-Response, close\r\nX-Response: remove\r\nProxy-Authenticate: Basic realm=bad\r\nWWW-Authenticate: Basic realm=site\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nok").await?;
     let mut configuration = config();
-    configuration.basic_auth.push(BasicAuthConfig { username: "user".into(), password: "pass".into() });
+    configuration.basic_auth.push(BasicAuthConfig {
+        username: "user".into(),
+        password: "pass".into(),
+    });
     let proxy = Running::start(configuration).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
     client.write_all(format!("GET http://{destination}/path?q=1 HTTP/1.1\r\nHost: wrong.invalid\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nAuthorization: Bearer origin-token\r\nConnection: X-Hop\r\nConnection: X-Extra\r\nX-Hop: remove\r\nX-Extra: remove\r\n\r\n").as_bytes()).await?;
@@ -126,14 +157,23 @@ async fn credentials_and_hop_headers_are_not_forwarded_but_origin_auth_is() -> R
 
 #[tokio::test]
 async fn each_keep_alive_request_is_authenticated() -> Result<()> {
-    let (destination, origin_task) = origin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await?;
+    let (destination, origin_task) =
+        origin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await?;
     let mut configuration = config();
-    configuration.basic_auth.push(BasicAuthConfig { username: "user".into(), password: "pass".into() });
+    configuration.basic_auth.push(BasicAuthConfig {
+        username: "user".into(),
+        password: "pass".into(),
+    });
     let proxy = Running::start(configuration).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
     let path = format!("GET http://{destination}/ HTTP/1.1\r\nHost: {destination}\r\n");
-    client.write_all(format!("{path}Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n").as_bytes()).await?;
-    assert!(read_response(&mut client).await?.0.starts_with("HTTP/1.1 200"));
+    client
+        .write_all(format!("{path}Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n").as_bytes())
+        .await?;
+    assert!(read_response(&mut client)
+        .await?
+        .0
+        .starts_with("HTTP/1.1 200"));
     origin_task.await??;
     client.write_all(format!("{path}\r\n").as_bytes()).await?;
     let (header, body) = read_response(&mut client).await?;
@@ -147,12 +187,19 @@ async fn each_keep_alive_request_is_authenticated() -> Result<()> {
 
 #[tokio::test]
 async fn each_keep_alive_request_can_route_to_a_different_origin() -> Result<()> {
-    let (first, first_task) = origin("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\na").await?;
-    let (second, second_task) = origin("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nb").await?;
+    let (first, first_task) =
+        origin("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\na").await?;
+    let (second, second_task) =
+        origin("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nb").await?;
     let proxy = Running::start(config()).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
     for (destination, expected) in [(first, b'a'), (second, b'b')] {
-        client.write_all(format!("GET http://{destination}/ HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes()).await?;
+        client
+            .write_all(
+                format!("GET http://{destination}/ HTTP/1.1\r\nHost: {destination}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await?;
         assert_eq!(read_response(&mut client).await?.1, vec![expected]);
     }
     first_task.await??;
@@ -165,16 +212,32 @@ async fn each_keep_alive_request_can_route_to_a_different_origin() -> Result<()>
 async fn filters_are_loaded_once_and_apply_to_each_request() -> Result<()> {
     let mut file = NamedTempFile::new()?;
     writeln!(file, "localhost")?;
-    let (destination, origin_task) = origin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await?;
-    let configuration = Config { filter_file: Some(file.path().to_string_lossy().into()), ..config() };
+    let (destination, origin_task) =
+        origin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await?;
+    let configuration = Config {
+        filter_file: Some(file.path().to_string_lossy().into()),
+        ..config()
+    };
     let proxy = Running::start(configuration).await?;
     drop(file);
     let mut client = TcpStream::connect(proxy.address).await?;
-    client.write_all(format!("GET http://{destination}/ HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes()).await?;
-    assert!(read_response(&mut client).await?.0.starts_with("HTTP/1.1 200"));
+    client
+        .write_all(
+            format!("GET http://{destination}/ HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes(),
+        )
+        .await?;
+    assert!(read_response(&mut client)
+        .await?
+        .0
+        .starts_with("HTTP/1.1 200"));
     origin_task.await??;
-    client.write_all(b"GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n").await?;
-    assert!(read_response(&mut client).await?.0.starts_with("HTTP/1.1 403"));
+    client
+        .write_all(b"GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await?;
+    assert!(read_response(&mut client)
+        .await?
+        .0
+        .starts_with("HTTP/1.1 403"));
     drop(client);
     proxy.stop().await
 }
@@ -191,10 +254,18 @@ async fn connect_preserves_early_bytes_and_half_close() -> Result<()> {
         stream.write_all(b"reply:hello").await?;
         Ok::<_, anyhow::Error>(())
     });
-    let configuration = Config { connect_ports: vec![destination.port()], ..config() };
+    let configuration = Config {
+        connect_ports: vec![destination.port()],
+        ..config()
+    };
     let proxy = Running::start(configuration).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
-    client.write_all(format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\nhello").as_bytes()).await?;
+    client
+        .write_all(
+            format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\nhello")
+                .as_bytes(),
+        )
+        .await?;
     assert!(read_header(&mut client).await?.starts_with("HTTP/1.1 200"));
     client.shutdown().await?;
     let mut response = Vec::new();
@@ -214,10 +285,18 @@ async fn connect_keeps_its_connection_permit_until_tunnel_closes() -> Result<()>
         stream.read_to_end(&mut Vec::new()).await?;
         Ok::<_, anyhow::Error>(())
     });
-    let configuration = Config { connect_ports: vec![destination.port()], max_clients: 1, ..config() };
+    let configuration = Config {
+        connect_ports: vec![destination.port()],
+        max_clients: 1,
+        ..config()
+    };
     let proxy = Running::start(configuration).await?;
     let mut first = TcpStream::connect(proxy.address).await?;
-    first.write_all(format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes()).await?;
+    first
+        .write_all(
+            format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes(),
+        )
+        .await?;
     assert!(read_header(&mut first).await?.starts_with("HTTP/1.1 200"));
     assert_eq!(proxy.metrics.active.load(Ordering::Relaxed), 1);
     let mut second = TcpStream::connect(proxy.address).await?;
@@ -231,7 +310,8 @@ async fn connect_keeps_its_connection_permit_until_tunnel_closes() -> Result<()>
         while proxy.metrics.active.load(Ordering::Relaxed) != 0 {
             sleep(Duration::from_millis(10)).await;
         }
-    }).await?;
+    })
+    .await?;
     proxy.stop().await
 }
 
@@ -291,30 +371,54 @@ async fn absolute_https_is_not_sent_as_plaintext_to_the_origin() -> Result<()> {
     let destination = listener.local_addr()?;
     let proxy = Running::start(config()).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
-    client.write_all(format!("GET https://{destination}/ HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes()).await?;
-    assert!(read_response(&mut client).await?.0.starts_with("HTTP/1.1 400"));
-    assert!(timeout(Duration::from_millis(100), listener.accept()).await.is_err());
+    client
+        .write_all(
+            format!("GET https://{destination}/ HTTP/1.1\r\nHost: {destination}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await?;
+    assert!(read_response(&mut client)
+        .await?
+        .0
+        .starts_with("HTTP/1.1 400"));
+    assert!(timeout(Duration::from_millis(100), listener.accept())
+        .await
+        .is_err());
     drop(client);
     proxy.stop().await
 }
 
 #[tokio::test]
 async fn source_acl_is_enforced_before_forwarding() -> Result<()> {
-    let configuration = Config { acl_rules: vec![(false, "all".into())], ..config() };
+    let configuration = Config {
+        acl_rules: vec![(false, "all".into())],
+        ..config()
+    };
     let proxy = Running::start(configuration).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
-    assert!(read_response(&mut client).await?.0.starts_with("HTTP/1.1 403"));
+    assert!(read_response(&mut client)
+        .await?
+        .0
+        .starts_with("HTTP/1.1 403"));
     drop(client);
     proxy.stop().await
 }
 
 #[tokio::test]
 async fn connect_port_zero_disables_tunnels() -> Result<()> {
-    let configuration = Config { connect_ports: Vec::new(), ..config() };
+    let configuration = Config {
+        connect_ports: Vec::new(),
+        ..config()
+    };
     let proxy = Running::start(configuration).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
-    client.write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n").await?;
-    assert!(read_response(&mut client).await?.0.starts_with("HTTP/1.1 403"));
+    client
+        .write_all(b"CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n")
+        .await?;
+    assert!(read_response(&mut client)
+        .await?
+        .0
+        .starts_with("HTTP/1.1 403"));
     drop(client);
     proxy.stop().await
 }
@@ -323,10 +427,19 @@ async fn connect_port_zero_disables_tunnels() -> Result<()> {
 async fn shutdown_forces_idle_tunnels_closed_after_grace_period() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let destination = listener.local_addr()?;
-    let configuration = Config { connect_ports: vec![destination.port()], timeout: 10, shutdown_timeout: 1, ..config() };
+    let configuration = Config {
+        connect_ports: vec![destination.port()],
+        timeout: 10,
+        shutdown_timeout: 1,
+        ..config()
+    };
     let proxy = Running::start(configuration).await?;
     let mut client = TcpStream::connect(proxy.address).await?;
-    client.write_all(format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes()).await?;
+    client
+        .write_all(
+            format!("CONNECT {destination} HTTP/1.1\r\nHost: {destination}\r\n\r\n").as_bytes(),
+        )
+        .await?;
     assert!(read_header(&mut client).await?.starts_with("HTTP/1.1 200"));
     let (mut upstream, _) = listener.accept().await?;
     proxy.shutdown.cancel();
@@ -340,13 +453,19 @@ async fn shutdown_forces_idle_tunnels_closed_after_grace_period() -> Result<()> 
 
 #[tokio::test]
 async fn header_deadline_is_not_reset_by_trickled_bytes() -> Result<()> {
-    let configuration = Config { header_timeout: 1, timeout: 5, ..config() };
+    let configuration = Config {
+        header_timeout: 1,
+        timeout: 5,
+        ..config()
+    };
     let proxy = Running::start(configuration).await?;
     let client = TcpStream::connect(proxy.address).await?;
     let (mut reader, mut writer) = client.into_split();
     let writer_task = tokio::spawn(async move {
         for byte in b"GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n" {
-            if writer.write_all(&[*byte]).await.is_err() { break; }
+            if writer.write_all(&[*byte]).await.is_err() {
+                break;
+            }
             sleep(Duration::from_millis(150)).await;
         }
     });

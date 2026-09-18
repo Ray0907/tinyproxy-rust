@@ -24,13 +24,17 @@ impl ProxyServer {
         let runtime = Arc::new(Runtime::new(config)?);
         let mut listeners = Vec::new();
         for address in &runtime.config.listen_addresses {
-            listeners.push(TcpListener::bind(SocketAddr::new(*address, runtime.config.port)).await?);
+            listeners
+                .push(TcpListener::bind(SocketAddr::new(*address, runtime.config.port)).await?);
         }
         Ok(Self { listeners, runtime })
     }
 
     pub fn local_addresses(&self) -> Result<Vec<SocketAddr>> {
-        self.listeners.iter().map(|listener| listener.local_addr().map_err(Into::into)).collect()
+        self.listeners
+            .iter()
+            .map(|listener| listener.local_addr().map_err(Into::into))
+            .collect()
     }
 
     pub fn shutdown_token(&self) -> CancellationToken {
@@ -74,7 +78,10 @@ impl ProxyServer {
                     let guard = Arc::new(ConnectionGuard::new(permit, runtime.metrics.clone()));
                     let connection_runtime = runtime.clone();
                     runtime.tasks.spawn(async move {
-                        if connection::serve(stream, address, connection_runtime, guard).await.is_err() {
+                        if connection::serve(stream, address, connection_runtime, guard)
+                            .await
+                            .is_err()
+                        {
                             // Do not log raw requests, URLs, headers, or credentials.
                             debug!("Client connection ended with a protocol or I/O error");
                         }
@@ -87,7 +94,13 @@ impl ProxyServer {
             result?;
         }
         runtime.tasks.close();
-        if timeout(Duration::from_secs(runtime.config.shutdown_timeout), runtime.tasks.wait()).await.is_err() {
+        if timeout(
+            Duration::from_secs(runtime.config.shutdown_timeout),
+            runtime.tasks.wait(),
+        )
+        .await
+        .is_err()
+        {
             runtime.force_shutdown.cancel();
             runtime.tasks.wait().await;
         }

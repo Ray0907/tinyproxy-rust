@@ -4,7 +4,9 @@ use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, VIA};
+use hyper::header::{
+    HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, VIA,
+};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -41,12 +43,19 @@ pub async fn serve(
         runtime.metrics.rejected.fetch_add(1, Ordering::Relaxed);
         let _ = timeout(
             Duration::from_secs(2),
-            stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
-        ).await;
+            stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
+        )
+        .await;
         return Ok(());
     }
     let activity = Activity::new(Duration::from_secs(runtime.config.timeout));
-    let io = TokioIo::new(ActivityIo::new(stream, activity.clone(), Some(runtime.metrics.clone())));
+    let io = TokioIo::new(ActivityIo::new(
+        stream,
+        activity.clone(),
+        Some(runtime.metrics.clone()),
+    ));
     let context = Arc::new(Context {
         runtime: runtime.clone(),
         guard,
@@ -92,30 +101,50 @@ pub async fn serve(
     result
 }
 
-async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> HttpResult<Response<Body>> {
+async fn handle(
+    mut request: Request<Incoming>,
+    context: Arc<Context>,
+) -> HttpResult<Response<Body>> {
     let runtime = &context.runtime;
     runtime.metrics.requests.fetch_add(1, Ordering::Relaxed);
     if !runtime.auth.authenticate(request.headers()) {
-        runtime.metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-        return Err((StatusCode::PROXY_AUTHENTICATION_REQUIRED, "Proxy authentication required"));
+        runtime
+            .metrics
+            .auth_failures
+            .fetch_add(1, Ordering::Relaxed);
+        return Err((
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "Proxy authentication required",
+        ));
     }
     let target = Target::parse(&request).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let is_connect = request.method() == Method::CONNECT;
-    if !runtime.filter.is_allowed(&target.host, &target.url, is_connect) {
+    if !runtime
+        .filter
+        .is_allowed(&target.host, &target.url, is_connect)
+    {
         return Err((StatusCode::FORBIDDEN, "Blocked by filter"));
     }
     if !is_connect && runtime.config.stat_host.as_deref() == Some(target.host.as_str()) {
         if request.method() != Method::GET && request.method() != Method::HEAD {
-            return Err((StatusCode::METHOD_NOT_ALLOWED, "Statistics require GET or HEAD"));
+            return Err((
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Statistics require GET or HEAD",
+            ));
         }
-        return Ok(text_response(StatusCode::OK, runtime.metrics.to_html(), "text/html; charset=utf-8"));
+        return Ok(text_response(
+            StatusCode::OK,
+            runtime.metrics.to_html(),
+            "text/html; charset=utf-8",
+        ));
     }
     if is_connect {
         if !runtime.config.connect_ports.contains(&target.port) {
             return Err((StatusCode::FORBIDDEN, "CONNECT port not allowed"));
         }
         // Validate hop-by-hop syntax before switching protocols.
-        strip_hop_by_hop(request.headers_mut()).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        strip_hop_by_hop(request.headers_mut())
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
         let target_stream = dial(&target, runtime).await?;
         let upgrade = hyper::upgrade::on(&mut request);
         context.upgraded.store(true, Ordering::Relaxed);
@@ -143,14 +172,19 @@ async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> HttpRe
     if request.headers().contains_key("upgrade") {
         return Err((StatusCode::NOT_IMPLEMENTED, "HTTP Upgrade is not supported"));
     }
-    strip_hop_by_hop(request.headers_mut()).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    strip_hop_by_hop(request.headers_mut())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     request.headers_mut().insert(HOST, target.authority);
     add_via(request.headers_mut(), runtime);
     *request.uri_mut() = target.path;
     *request.version_mut() = Version::HTTP_11;
 
     let target_stream = dial(&target, runtime).await?;
-    let io = TokioIo::new(ActivityIo::new(target_stream, context.activity.clone(), None));
+    let io = TokioIo::new(ActivityIo::new(
+        target_stream,
+        context.activity.clone(),
+        None,
+    ));
     let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream handshake failed"))?;
@@ -165,26 +199,37 @@ async fn handle(mut request: Request<Incoming>, context: Arc<Context>) -> HttpRe
             _ = driver_context.runtime.force_shutdown.cancelled() => {},
         }
     });
-    let mut response = sender.send_request(request).await
+    let mut response = sender
+        .send_request(request)
+        .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream request failed"))?;
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         return Err((StatusCode::BAD_GATEWAY, "Unexpected upstream upgrade"));
     }
-    strip_hop_by_hop(response.headers_mut()).map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
+    strip_hop_by_hop(response.headers_mut())
+        .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
     add_via(response.headers_mut(), runtime);
-    Ok(response.map(|body| body.map_err(|error| -> BoxError { Box::new(error) }).boxed_unsync()))
+    Ok(response.map(|body| {
+        body.map_err(|error| -> BoxError { Box::new(error) })
+            .boxed_unsync()
+    }))
 }
 
 async fn dial(target: &Target, runtime: &Runtime) -> HttpResult<TcpStream> {
-    transport::connect(&target.host, target.port, runtime.config.bind_address, runtime.config.connect_timeout)
-        .await
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                (StatusCode::GATEWAY_TIMEOUT, "Upstream connection timed out")
-            } else {
-                (StatusCode::BAD_GATEWAY, "Upstream connection failed")
-            }
-        })
+    transport::connect(
+        &target.host,
+        target.port,
+        runtime.config.bind_address,
+        runtime.config.connect_timeout,
+    )
+    .await
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            (StatusCode::GATEWAY_TIMEOUT, "Upstream connection timed out")
+        } else {
+            (StatusCode::BAD_GATEWAY, "Upstream connection failed")
+        }
+    })
 }
 
 struct Target {
@@ -202,7 +247,10 @@ impl Target {
         if connect && (uri.scheme().is_some() || uri.path_and_query().is_some()) {
             return Err("CONNECT requires host:port authority form");
         }
-        if uri.scheme_str().is_some_and(|scheme| !scheme.eq_ignore_ascii_case("http")) {
+        if uri
+            .scheme_str()
+            .is_some_and(|scheme| !scheme.eq_ignore_ascii_case("http"))
+        {
             return Err("Use CONNECT for HTTPS destinations");
         }
         if request.headers().get_all(HOST).iter().count() > 1 {
@@ -214,7 +262,9 @@ impl Target {
             if connect {
                 return Err("CONNECT requires an authority");
             }
-            request.headers().get(HOST)
+            request
+                .headers()
+                .get(HOST)
                 .and_then(|value| value.to_str().ok())
                 .ok_or("Host header required")?
                 .parse::<hyper::http::uri::Authority>()
@@ -224,20 +274,36 @@ impl Target {
             return Err("Invalid destination authority");
         }
         let raw = authority.as_str();
-        let explicit_port = raw.rsplit_once(':').filter(|(before, _)| !raw.starts_with('[') || before.ends_with(']'));
+        let explicit_port = raw
+            .rsplit_once(':')
+            .filter(|(before, _)| !raw.starts_with('[') || before.ends_with(']'));
         let port = if let Some((_, port)) = explicit_port {
-            port.parse::<u16>().ok().filter(|port| *port > 0).ok_or("Invalid destination port")?
+            port.parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or("Invalid destination port")?
         } else if connect {
             return Err("CONNECT requires an explicit port");
         } else {
             80
         };
-        let host = authority.host().trim_start_matches('[').trim_end_matches(']').trim_end_matches('.').to_ascii_lowercase();
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         if host.is_empty() {
             return Err("Empty destination host");
         }
-        let path = uri.path_and_query().map(|path| path.as_str()).unwrap_or("/");
-        if !connect && !path.starts_with('/') && !(path == "*" && request.method() == Method::OPTIONS) {
+        let path = uri
+            .path_and_query()
+            .map(|path| path.as_str())
+            .unwrap_or("/");
+        if !connect
+            && !path.starts_with('/')
+            && !(path == "*" && request.method() == Method::OPTIONS)
+        {
             return Err("Invalid HTTP request target");
         }
         Ok(Self {
@@ -253,12 +319,17 @@ impl Target {
 fn strip_hop_by_hop(headers: &mut HeaderMap) -> std::result::Result<(), &'static str> {
     let mut nominated = Vec::new();
     for value in headers.get_all(CONNECTION) {
-        for token in value.to_str().map_err(|_| "Invalid Connection header")?.split(',') {
+        for token in value
+            .to_str()
+            .map_err(|_| "Invalid Connection header")?
+            .split(',')
+        {
             let token = token.trim();
             if token.is_empty() {
                 continue;
             }
-            let name = HeaderName::from_bytes(token.as_bytes()).map_err(|_| "Invalid Connection token")?;
+            let name =
+                HeaderName::from_bytes(token.as_bytes()).map_err(|_| "Invalid Connection token")?;
             if name == "content-length" || name == "transfer-encoding" {
                 return Err("Connection must not nominate message framing headers");
             }
@@ -269,8 +340,15 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) -> std::result::Result<(), &'static
         headers.remove(name);
     }
     for name in [
-        "connection", "proxy-connection", "keep-alive", "proxy-authorization",
-        "proxy-authenticate", "te", "trailer", "transfer-encoding", "upgrade",
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
     ] {
         headers.remove(name);
     }
@@ -289,19 +367,35 @@ fn add_via(headers: &mut HeaderMap, runtime: &Runtime) {
 
 fn text_response(status: StatusCode, text: String, content_type: &'static str) -> Response<Body> {
     let length = text.len();
-    let body = Full::new(Bytes::from(text)).map_err(|never| -> BoxError { match never {} }).boxed_unsync();
+    let body = Full::new(Bytes::from(text))
+        .map_err(|never| -> BoxError { match never {} })
+        .boxed_unsync();
     let mut response = Response::new(body);
     *response.status_mut() = status;
-    response.headers_mut().insert("content-type", HeaderValue::from_static(content_type));
-    response.headers_mut().insert("content-length", HeaderValue::from_str(&length.to_string()).expect("valid length"));
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        "content-length",
+        HeaderValue::from_str(&length.to_string()).expect("valid length"),
+    );
     response
 }
 
 fn error_response(status: StatusCode, message: &'static str) -> Response<Body> {
-    let mut response = text_response(status, format!("{}\n", message), "text/plain; charset=utf-8");
-    response.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
+    let mut response = text_response(
+        status,
+        format!("{}\n", message),
+        "text/plain; charset=utf-8",
+    );
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
     if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
-        response.headers_mut().insert(PROXY_AUTHENTICATE, HeaderValue::from_static("Basic realm=\"Tinyproxy\""));
+        response.headers_mut().insert(
+            PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"Tinyproxy\""),
+        );
     }
     response
 }

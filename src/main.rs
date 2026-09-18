@@ -9,11 +9,18 @@ use tinyproxy_rust::{config::Config, runtime::Runtime, server::ProxyServer};
 struct Args {
     #[arg(short = 'c', long, default_value = "/etc/tinyproxy/tinyproxy.conf")]
     config: PathBuf,
-    #[arg(long, help = "Validate configuration, ACLs and filters without binding a socket")]
+    #[arg(
+        long,
+        help = "Validate configuration, ACLs and filters without binding a socket"
+    )]
     check: bool,
     #[arg(long)]
     debug: bool,
-    #[arg(short = 'd', long = "foreground", help = "Run in foreground (the default)")]
+    #[arg(
+        short = 'd',
+        long = "foreground",
+        help = "Run in foreground (the default)"
+    )]
     _foreground: bool,
     #[arg(short = 'v', long = "version", action = ArgAction::Version)]
     _version: Option<bool>,
@@ -23,8 +30,14 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let config = Config::from_file(&args.config)?;
-    let level = if args.debug { log::LevelFilter::Debug } else { config.log_level.parse()? };
-    env_logger::Builder::from_default_env().filter_level(level).try_init()?;
+    let level = if args.debug {
+        log::LevelFilter::Debug
+    } else {
+        config.log_level.parse()?
+    };
+    env_logger::Builder::from_default_env()
+        .filter_level(level)
+        .try_init()?;
     if args.check {
         Runtime::new(config)?;
         println!("Configuration and policy validation passed");
@@ -49,7 +62,8 @@ async fn main() -> Result<()> {
 async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
             result = tokio::signal::ctrl_c() => result,
             _ = terminate.recv() => Ok(()),
