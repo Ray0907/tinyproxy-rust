@@ -6,7 +6,7 @@ use std::io::{self, IoSlice};
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
@@ -118,11 +118,6 @@ impl AsyncWrite for Mock {
     }
 }
 
-struct Noop;
-impl Wake for Noop {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn activity() -> Activity {
     Activity::new(Duration::from_secs(60))
 }
@@ -132,8 +127,7 @@ fn vectored_partial_write_counts_only_accepted_bytes_once() {
     let (mock, writes) = Mock::new(&[], true);
     let metrics = Arc::new(Metrics::default());
     let mut io = ActivityIo::new(mock, activity(), Some(metrics.clone()));
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let bufs = [
         IoSlice::new(b""),
         IoSlice::new(b"ab"),
@@ -156,8 +150,7 @@ fn pending_error_and_zero_writes_do_not_count_as_traffic() {
     let (mock, writes) = Mock::new(&[], true);
     let metrics = Arc::new(Metrics::default());
     let mut io = ActivityIo::new(mock, activity(), Some(metrics.clone()));
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let bufs = [IoSlice::new(b"abc")];
     writes.lock().unwrap().pending = true;
     assert!(Pin::new(&mut io)
@@ -190,8 +183,7 @@ fn non_vectored_capability_and_fallback_are_preserved() {
     let (mock, writes) = Mock::new(&[], false);
     let metrics = Arc::new(Metrics::default());
     let mut io = ActivityIo::new(mock, activity(), Some(metrics.clone()));
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     assert!(!io.is_write_vectored());
     let bufs = [IoSlice::new(b""), IoSlice::new(b"ab"), IoSlice::new(b"cd")];
     assert!(matches!(
@@ -207,8 +199,7 @@ fn empty_vectors_flush_and_shutdown_do_not_add_bytes() {
     let (mock, writes) = Mock::new(&[], true);
     let metrics = Arc::new(Metrics::default());
     let mut io = ActivityIo::new(mock, activity(), Some(metrics.clone()));
-    let waker = Waker::from(Arc::new(Noop));
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     assert!(matches!(
         Pin::new(&mut io).poll_write_vectored(&mut cx, &[]),
         Poll::Ready(Ok(0))
@@ -251,8 +242,7 @@ async fn detection_and_nested_activity_preserve_vectored_io_and_all_prefix_bytes
             outer_metrics.bytes_in.load(Ordering::Relaxed),
             input.len() as u64
         );
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let bufs = [IoSlice::new(b"ab"), IoSlice::new(b"cd")];
         assert!(matches!(
             Pin::new(&mut io).poll_write_vectored(&mut cx, &bufs),
