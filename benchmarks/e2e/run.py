@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded local-only proxy benchmarks. Retains every round, config and metadata.
-
-Requires compiled bench-driver, Rust/C proxies, Linux /proc, taskset and openssl.
-Private test credentials are excluded from published results.
-"""
+"""Bounded local-only proxy benchmarks with retained raw rounds and metadata."""
 from __future__ import annotations
 import argparse
 import collections
@@ -64,6 +60,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--rust", required=True)
     ap.add_argument("--c-proxy", required=True)
+    ap.add_argument("--rust-nodelay", help="optional explicitly patched experimental binary")
     ap.add_argument("--driver", required=True)
     ap.add_argument("--output", default="benchmark-results")
     ap.add_argument("--rounds", type=int, default=3)
@@ -72,11 +69,13 @@ def main() -> None:
     if not 1 <= args.rounds <= 5 or not 1 <= args.seconds <= 15:
         raise ValueError("bounded rounds/duration required")
     args.rust, args.c_proxy, args.driver = [str(Path(x).resolve(strict=True)) for x in (args.rust, args.c_proxy, args.driver)]
+    if args.rust_nodelay:
+        args.rust_nodelay = str(Path(args.rust_nodelay).resolve(strict=True))
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     cpus = sorted(os.sched_getaffinity(0))
     if len(cpus) < 3:
-        raise RuntimeError("benchmark needs >=3 CPUs to isolate proxy, origin and generator")
+        raise RuntimeError("benchmark needs >=3 logical CPUs")
     proxy_cpu, origin_cpu, driver_cpu = cpus[:3]
     env = dict(os.environ, TOKIO_WORKER_THREADS="1", GOMAXPROCS="1", RUST_LOG="off")
     for k in list(env):
@@ -87,16 +86,20 @@ def main() -> None:
             "c_release": "1.11.3", "c_tar_sha256": "9bcf46db1a2375ff3e3d27a41982f1efec4706cce8899ff9f33323a8218f7592",
             "kernel": platform.platform(), "cpu_affinity": cpus,
             "proxy_cpu": proxy_cpu, "origin_cpu": origin_cpu, "generator_cpu": driver_cpu,
-            "lscpu": checked(["lscpu"]), "go": checked(["go", "version"]),
-            "rustc": checked(["rustc", "--version"]), "gcc": checked(["gcc", "--version"]).splitlines()[0],
+            "lscpu": checked(["lscpu"]), "topology": checked(["lscpu", "-e=CPU,CORE,SOCKET"]),
+            "go": checked(["go", "version"]), "rustc": checked(["rustc", "--version"]),
+            "gcc": checked(["gcc", "--version"]).splitlines()[0],
             "curl": checked(["/usr/bin/curl", "--version"]).splitlines()[0],
             "memory": Path("/proc/meminfo").read_text(), "rounds": args.rounds, "measurement_seconds": args.seconds,
             "warmup_seconds": 1, "sampler_interval_seconds": .1,
             "runtime": {"TOKIO_WORKER_THREADS": 1, "GOMAXPROCS": 1},
             "limits": Path("/proc/self/limits").read_text(),
-            "methodology": "closed-loop fixed concurrency; response bytes validated every request; successful full-body latency; no public origin; no TLS verification bypass",
+            "methodology": "closed-loop fixed concurrency; every response byte validated; successful full-body latency; no Internet origin or TLS bypass",
             "c_build": "release tarball ./configure --disable-manpage-support CFLAGS=-O3 -DNDEBUG; make",
-            "rust_build": "cargo build --release --locked on pinned source, unchanged runtime code"}
+            "rust_build": "cargo build --release --locked on pinned source, unchanged baseline runtime code",
+            "nodelay_experiment": bool(args.rust_nodelay),
+            "nodelay_change": "TCP_NODELAY=true on accepted and outgoing sockets; separate binary, same base/dependencies",
+            "limits_note": "affinity uses logical CPUs; SMT siblings may share a physical core"}
     (out / "metadata.json").write_text(json.dumps(meta, indent=2))
     print("METADATA " + json.dumps(meta), flush=True)
     with tempfile.TemporaryDirectory(prefix="proxy-benchmark-cert-") as certdir:
@@ -109,14 +112,16 @@ def main() -> None:
             if impl == "direct":
                 yield None
                 return
-            binary = args.c_proxy if impl == "c" else args.rust
-            port = 18889 if impl == "rust-tls" else 18888
+            binary = args.c_proxy if impl == "c" else (args.rust_nodelay if "nodelay" in impl else args.rust)
+            port = 18889 if impl.endswith("-tls") else 18888
             common = f"Listen 127.0.0.1\nPort {port}\nTimeout 60\nMaxClients 1024\nAllow 127.0.0.1\nConnectPort 18081\n"
             if impl == "c":
-                content = common + "LogLevel Critical\nLogFile /dev/null\nPidFile /tmp/tinyproxy-benchmark.pid\n"
+                # Default stdout is captured below. Tinyproxy's safe file opener
+                # rejects /dev/null as a non-regular log file.
+                content = common + "LogLevel Critical\nPidFile /tmp/tinyproxy-benchmark.pid\n"
             else:
                 content = common + "LogLevel Off\nShutdownTimeout 1\nMaxInflightRequests 1024\nMaxConcurrentStreams 32\n"
-                content += f"TLSCert {cert}\nTLSKey {key}\nHTTP2 Yes\n" if impl == "rust-tls" else "AllowH2C Yes\n"
+                content += f"TLSCert {cert}\nTLSKey {key}\nHTTP2 Yes\n" if impl.endswith("-tls") else "AllowH2C Yes\n"
             conf = out / f"{name}.conf"
             conf.write_text(content)
             log = (out / f"{name}.proxy.log").open("wb")
@@ -124,7 +129,10 @@ def main() -> None:
             if impl == "c": cmd.append("-d")
             p = subprocess.Popen(cmd, stdout=log, stderr=log, env=env)
             try:
-                ready(port, p)
+                try:
+                    ready(port, p)
+                except RuntimeError as error:
+                    raise RuntimeError(f"{name}: {error}: " + (out / f"{name}.proxy.log").read_text(errors="replace")) from error
                 time.sleep(.2)
                 yield p
             finally:
@@ -156,6 +164,13 @@ def main() -> None:
             case("rust-h2tls-get-1MiB-8", "rust-tls", "h2tls", 8, 1<<20)
             for impl, proto in (("direct", "h1"), ("c", "h1"), ("rust", "h1"), ("rust-tls", "h2tls")):
                 case(f"{impl}-{proto}-tunnel-1MiB-8", impl, proto, 8, 1<<20, kind="tunnel")
+            if args.rust_nodelay:
+                for proto in ("h2c", "h2tls"):
+                    for c in (1, 32):
+                        case(f"nodelay-{proto}-{c}", "rust-nodelay-tls" if proto == "h2tls" else "rust-nodelay", proto, c)
+                case("nodelay-h1-reuse-32", "rust-nodelay")
+                case("nodelay-post-1MiB-8", "rust-nodelay", c=8, size=1<<20, method="POST", fresh=True)
+                case("nodelay-h1-tunnel-1MiB-8", "rust-nodelay", c=8, size=1<<20, kind="tunnel")
             (out / "cases.json").write_text(json.dumps(cases, indent=2))
             all_rounds = []
             rng = random.Random(20260919)
@@ -164,7 +179,7 @@ def main() -> None:
                 for item in order:
                     name = f"r{r}-{item['name']}"
                     with service(item["impl"], name) as p:
-                        port = 18889 if item["impl"] == "rust-tls" else 18888
+                        port = 18889 if item["impl"].endswith("-tls") else 18888
                         command = ["taskset", "-c", str(driver_cpu), args.driver,
                                    f"-protocol={item['protocol']}", f"-c={item['c']}", f"-size={item['size']}",
                                    f"-method={item['method']}", f"-kind={item['kind']}",
@@ -210,7 +225,7 @@ def main() -> None:
                     name = f"idle-{impl}-{proto}-{c}"
                     with service(impl, name) as p:
                         baseline = snapshot(p.pid)
-                        port = 18889 if impl == "rust-tls" else 18888
+                        port = 18889 if impl.endswith("-tls") else 18888
                         output = (out / f"{name}.jsonl").open("w")
                         errfile = (out / f"{name}.log").open("w")
                         loader = subprocess.Popen(["taskset", "-c", str(driver_cpu), args.driver, "-kind=idle", f"-protocol={proto}",
@@ -251,7 +266,8 @@ def main() -> None:
             (out / "summary.json").write_text(json.dumps(summary, indent=2))
             print("SUMMARY_JSON " + json.dumps(summary, separators=(",", ":")), flush=True)
             lines = ["# Loopback benchmark — pinned proxy implementations", "", "Rust: `d500d2510475daafa8269e09caea6d2043c26aa5`; C: `1.11.3`.", "",
-                     f"{args.rounds} rounds; 1 s warmup + {args.seconds} s measurement. Order shuffled with fixed seed. One logical CPU per process; origin and generator on separate cores.", "",
+                     f"{args.rounds} rounds; 1 s warmup + {args.seconds} s measurement. Shuffled order. One logical CPU per process; physical cores may be shared through SMT.", "",
+                     "Cases prefixed nodelay use a separate experimental binary with TCP_NODELAY enabled; this is not main.", "",
                      "Closed-loop latency, successful full-body responses only; not an open-loop tail-latency SLA. All response bytes checked. RSS/CPU sampled over warmup and measurement. Shared CI runner, no WAN/TLS-loss modeling.", "",
                      "Values are medians of per-round values. RPS is completed, validated responses / elapsed measurement+drain time. Tunnel MiB/s is one-way payload; echo carries the same payload back.", "",
                      "| Case | req/s | req/s range | MiB/s | p50 ms | p99 ms | errors | proxy RSS MiB | proxy CPU % |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]

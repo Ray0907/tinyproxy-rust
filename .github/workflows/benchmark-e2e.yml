@@ -24,6 +24,8 @@ jobs:
           path: tested-source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -34,6 +36,7 @@ jobs:
           set -euo pipefail
           mkdir -p benchmark-results
           (cd tested-source && cargo build --release --locked) >benchmark-results/rust-build.log 2>&1 || { tail -80 benchmark-results/rust-build.log; exit 1; }
+          cp tested-source/target/release/tinyproxy-rust ./rust-baseline
           curl --fail --location --retry 3 https://github.com/tinyproxy/tinyproxy/releases/download/1.11.3/tinyproxy-1.11.3.tar.gz -o /tmp/tinyproxy.tar.gz
           echo '9bcf46db1a2375ff3e3d27a41982f1efec4706cce8899ff9f33323a8218f7592  /tmp/tinyproxy.tar.gz' | sha256sum -c -
           mkdir -p c-source
@@ -44,20 +47,31 @@ jobs:
           cp tested-source/Cargo.lock benchmark-results/
           git rev-parse HEAD > benchmark-results/harness-commit.txt
           git -C tested-source rev-parse HEAD > benchmark-results/tested-commit.txt
-          sha256sum tested-source/target/release/tinyproxy-rust c-source/src/tinyproxy bench-driver > benchmark-results/binary-sha256.txt
-      - name: Re-run regression suite and real curl interoperability
+          sha256sum rust-baseline c-source/src/tinyproxy bench-driver > benchmark-results/binary-sha256.txt
+      - name: Re-run unchanged baseline regressions and real curl interoperability
         shell: bash
         run: |
           set -euo pipefail
           (cd tested-source && cargo test --all-targets --locked) >benchmark-results/tests.log 2>&1 || { tail -100 benchmark-results/tests.log; exit 1; }
           grep -E '^running [0-9]+ tests|^test result:' benchmark-results/tests.log
-          python3 tested-source/scripts/test_curl_proxy.py --binary tested-source/target/release/tinyproxy-rust --curl /usr/bin/curl | tee benchmark-results/curl.log
-      - name: Run fixed-concurrency benchmarks and idle-tunnel measurements
+          python3 tested-source/scripts/test_curl_proxy.py --binary ./rust-baseline --curl /usr/bin/curl | tee benchmark-results/curl.log
+      - name: Build and validate separately labeled TCP_NODELAY experiment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 benchmarks/e2e/nodelay_experiment.py tested-source
+          (cd tested-source && cargo fmt --all && cargo test --all-targets --locked && cargo clippy --all-targets --locked -- -D warnings && cargo build --release --locked) >benchmark-results/nodelay-build-test.log 2>&1 || { tail -100 benchmark-results/nodelay-build-test.log; exit 1; }
+          cp tested-source/target/release/tinyproxy-rust ./rust-nodelay
+          git -C tested-source diff -- src/connection.rs src/transport.rs > benchmark-results/nodelay.patch
+          sha256sum rust-nodelay >> benchmark-results/binary-sha256.txt
+          grep -E '^running [0-9]+ tests|^test result:|Finished' benchmark-results/nodelay-build-test.log
+          python3 tested-source/scripts/test_curl_proxy.py --binary ./rust-nodelay --curl /usr/bin/curl | tee benchmark-results/nodelay-curl.log
+      - name: Run interleaved baselines and experimental cases, then held tunnels
         shell: bash
         run: |
           set -euo pipefail
           ulimit -n 32768
-          python3 benchmarks/e2e/run.py --rust tested-source/target/release/tinyproxy-rust --c-proxy c-source/src/tinyproxy --driver ./bench-driver --output benchmark-results --rounds 3 --seconds 4 | tee benchmark-results/run.log
+          python3 benchmarks/e2e/run.py --rust ./rust-baseline --rust-nodelay ./rust-nodelay --c-proxy c-source/src/tinyproxy --driver ./bench-driver --output benchmark-results --rounds 3 --seconds 4 | tee benchmark-results/run.log
       - name: Retain results even when a case fails
         if: always()
         uses: actions/upload-artifact@v4
