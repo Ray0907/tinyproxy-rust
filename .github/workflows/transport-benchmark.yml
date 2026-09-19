@@ -1,0 +1,82 @@
+name: Transport regression benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [perf/http2-transport]
+    paths:
+      - 'src/**'
+      - 'scripts/bench_transport.py'
+      - '.github/workflows/transport-benchmark.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: transport-benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: d500d2510475daafa8269e09caea6d2043c26aa5
+          path: baseline-source
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: fbd6141e946261011c5f01696050f0d15ef3a99a
+          path: benchmark-reference
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.98.1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: false
+      - name: Build pinned baseline, candidate and independent driver
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p transport-results
+          export CARGO_TARGET_DIR="$PWD/shared-target"
+          cargo build --release --locked >transport-results/candidate-build.log 2>&1
+          cp shared-target/release/tinyproxy-rust ./candidate-proxy
+          (cd baseline-source && cargo build --release --locked) >transport-results/baseline-build.log 2>&1
+          cp shared-target/release/tinyproxy-rust ./baseline-proxy
+          (cd benchmark-reference/benchmarks/e2e && go mod tidy && go build -trimpath -o ../../../bench-driver .) >transport-results/driver-build.log 2>&1
+          cp benchmark-reference/benchmarks/e2e/go.mod benchmark-reference/benchmarks/e2e/go.sum transport-results/
+          cp Cargo.lock transport-results/
+          git rev-parse HEAD >transport-results/candidate-commit.txt
+          git -C baseline-source rev-parse HEAD >transport-results/baseline-commit.txt
+          git -C benchmark-reference rev-parse HEAD >transport-results/driver-commit.txt
+          sha256sum candidate-proxy baseline-proxy bench-driver >transport-results/binary-sha256.txt
+          rustc --version >transport-results/compiler-versions.txt
+          go version >>transport-results/compiler-versions.txt
+          /usr/bin/curl --version >>transport-results/compiler-versions.txt
+      - name: Verify candidate with curl and retain regression output
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --all-targets --locked >transport-results/tests.log 2>&1 || { tail -100 transport-results/tests.log; exit 1; }
+          python3 scripts/test_curl_proxy.py --binary ./candidate-proxy --curl /usr/bin/curl | tee transport-results/curl.log
+          python3 -m py_compile scripts/bench_transport.py
+      - name: Measure three shuffled rounds and held tunnels
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -n 32768
+          python3 scripts/bench_transport.py --baseline ./baseline-proxy --candidate ./candidate-proxy --driver ./bench-driver --output transport-results --rounds 3 --seconds 2 | tee transport-results/run.log
+      - name: Retain evidence, including partial results on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transport-benchmark-${{ github.run_id }}
+          path: transport-results/
+          retention-days: 30
+          if-no-files-found: warn

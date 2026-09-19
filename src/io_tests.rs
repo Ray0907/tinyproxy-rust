@@ -1,3 +1,6 @@
+use crate::protocol;
+use crate::runtime::Metrics;
+use crate::transport::{Activity, ActivityIo};
 use std::collections::VecDeque;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
@@ -5,9 +8,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
-use tinyproxy_rust::protocol;
-use tinyproxy_rust::runtime::Metrics;
-use tinyproxy_rust::transport::{Activity, ActivityIo};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 #[derive(Default)]
@@ -134,7 +134,11 @@ fn vectored_partial_write_counts_only_accepted_bytes_once() {
     let mut io = ActivityIo::new(mock, activity(), Some(metrics.clone()));
     let waker = Waker::from(Arc::new(Noop));
     let mut cx = Context::from_waker(&waker);
-    let bufs = [IoSlice::new(b""), IoSlice::new(b"ab"), IoSlice::new(b"cdef")];
+    let bufs = [
+        IoSlice::new(b""),
+        IoSlice::new(b"ab"),
+        IoSlice::new(b"cdef"),
+    ];
     assert!(io.is_write_vectored());
     assert!(matches!(
         Pin::new(&mut io).poll_write_vectored(&mut cx, &bufs),
