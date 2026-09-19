@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::connection;
 use crate::runtime::{ConnectionGuard, Metrics, Runtime};
+use crate::transport;
 use anyhow::Result;
 use log::{debug, warn};
 use std::net::SocketAddr;
@@ -75,6 +76,11 @@ impl ProxyServer {
                         drop(stream);
                         continue;
                     };
+                    if let Err(error) = transport::configure_client_socket(&stream) {
+                        runtime.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+                        warn!("Client socket setup failed: {}", error.kind());
+                        continue;
+                    }
                     let guard = Arc::new(ConnectionGuard::new(permit, runtime.metrics.clone()));
                     let connection_runtime = runtime.clone();
                     runtime.tasks.spawn(async move {
