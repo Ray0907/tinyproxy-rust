@@ -39,17 +39,26 @@ jobs:
         with:
           go-version: '1.27.1'
           cache: false
-      - name: Build pinned baseline, candidate and independent driver
+      - name: Build isolated baseline, candidate and independent driver
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p transport-results
-          export CARGO_TARGET_DIR="$PWD/shared-target"
-          cargo build --release --locked >transport-results/candidate-build.log 2>&1
-          cp shared-target/release/tinyproxy-rust ./candidate-proxy
-          (cd baseline-source && cargo build --release --locked) >transport-results/baseline-build.log 2>&1
-          cp shared-target/release/tinyproxy-rust ./baseline-proxy
-          (cd benchmark-reference/benchmarks/e2e && go mod tidy && go build -trimpath -o ../../../bench-driver .) >transport-results/driver-build.log 2>&1
+          test "$(git -C baseline-source rev-parse HEAD)" = d500d2510475daafa8269e09caea6d2043c26aa5
+          cmp Cargo.lock baseline-source/Cargo.lock
+          git diff --exit-code
+          git -C baseline-source diff --exit-code
+          # Separate target directories are mandatory. Sharing a target can
+          # reuse the wrong local package when checkout mtimes are identical.
+          cargo build --release --locked --target-dir "$PWD/candidate-target" >transport-results/candidate-build.log 2>&1 || { tail -80 transport-results/candidate-build.log; exit 1; }
+          cp candidate-target/release/tinyproxy-rust ./candidate-proxy
+          cargo build --release --locked --manifest-path baseline-source/Cargo.toml --target-dir "$PWD/baseline-target" >transport-results/baseline-build.log 2>&1 || { tail -80 transport-results/baseline-build.log; exit 1; }
+          cp baseline-target/release/tinyproxy-rust ./baseline-proxy
+          if cmp -s candidate-proxy baseline-proxy; then
+            echo 'ERROR: baseline and candidate binaries are identical; refusing comparison.' >&2
+            exit 1
+          fi
+          (cd benchmark-reference/benchmarks/e2e && go mod tidy && go build -trimpath -o ../../../bench-driver .) >transport-results/driver-build.log 2>&1 || { cat transport-results/driver-build.log; exit 1; }
           cp benchmark-reference/benchmarks/e2e/go.mod benchmark-reference/benchmarks/e2e/go.sum transport-results/
           cp Cargo.lock transport-results/
           git rev-parse HEAD >transport-results/candidate-commit.txt
@@ -65,6 +74,7 @@ jobs:
           set -euo pipefail
           cargo test --all-targets --locked >transport-results/tests.log 2>&1 || { tail -100 transport-results/tests.log; exit 1; }
           python3 scripts/test_curl_proxy.py --binary ./candidate-proxy --curl /usr/bin/curl | tee transport-results/curl.log
+          python3 scripts/test_curl_proxy.py --binary ./baseline-proxy --curl /usr/bin/curl | tee transport-results/baseline-curl.log
           python3 -m py_compile scripts/bench_transport.py
       - name: Measure three shuffled rounds and held tunnels
         shell: bash
