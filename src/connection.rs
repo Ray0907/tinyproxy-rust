@@ -1,17 +1,18 @@
-use crate::runtime::{ConnectionGuard, Runtime};
+use crate::exchange::{self, Body, BoxError, CancelOnDrop, Exchange};
+use crate::protocol::{self, BoxIo};
+use crate::runtime::{ConnectionGuard, Executor, Runtime};
 use crate::transport::{self, Activity, ActivityIo};
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use bytes::Bytes;
-use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{
-    HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, VIA,
+    HeaderMap, HeaderName, HeaderValue, CONNECTION, COOKIE, HOST, PROXY_AUTHENTICATE, VIA,
 };
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::convert::Infallible;
-use std::error::Error;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,8 +22,6 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
-type BoxError = Box<dyn Error + Send + Sync>;
-type Body = UnsyncBoxBody<Bytes, BoxError>;
 type HttpResult<T> = std::result::Result<T, (StatusCode, &'static str)>;
 
 struct Context {
@@ -30,7 +29,7 @@ struct Context {
     guard: Arc<ConnectionGuard>,
     activity: Activity,
     cancelled: CancellationToken,
-    upgraded: AtomicBool,
+    http1_upgraded: AtomicBool,
 }
 
 pub async fn serve(
@@ -39,16 +38,61 @@ pub async fn serve(
     runtime: Arc<Runtime>,
     guard: Arc<ConnectionGuard>,
 ) -> Result<()> {
+    // Reject before TLS work; never send plaintext errors on a TLS/H2 listener.
     if !runtime.acl.is_allowed(address.ip()) {
         runtime.metrics.rejected.fetch_add(1, Ordering::Relaxed);
-        let _ = timeout(
-            Duration::from_secs(2),
-            stream.write_all(
-                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            ),
-        )
-        .await;
+        if runtime.tls.is_none() && !runtime.config.allow_h2c {
+            let _ = timeout(
+                Duration::from_secs(2),
+                stream.write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ),
+            )
+            .await;
+        }
         return Ok(());
+    }
+    let negotiate = async {
+        let (h2, io): (bool, BoxIo) = if let Some(acceptor) = &runtime.tls {
+            let tls = timeout(
+                Duration::from_secs(runtime.config.tls_handshake_timeout),
+                acceptor.accept(stream),
+            )
+            .await??;
+            let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+            if h2 {
+                let (detected, io) = timeout(
+                    Duration::from_secs(runtime.config.header_timeout),
+                    protocol::detect(Box::new(tls)),
+                )
+                .await??;
+                ensure!(detected, "HTTP/2 ALPN requires an HTTP/2 preface");
+                (true, io)
+            } else {
+                // Absent ALPN means HTTP/1. Do not sniff and silently override it.
+                (false, Box::new(tls))
+            }
+        } else if runtime.config.allow_h2c {
+            timeout(
+                Duration::from_secs(runtime.config.header_timeout),
+                protocol::detect(Box::new(stream)),
+            )
+            .await??
+        } else {
+            (false, Box::new(stream))
+        };
+        Ok::<_, anyhow::Error>((h2, io))
+    };
+    let (h2, stream) = tokio::select! {
+        result = negotiate => result?,
+        _ = runtime.shutdown.cancelled() => return Ok(()),
+        _ = runtime.force_shutdown.cancelled() => return Ok(()),
+    };
+    if h2 {
+        runtime
+            .metrics
+            .http2_connections
+            .fetch_add(1, Ordering::Relaxed);
     }
     let activity = Activity::new(Duration::from_secs(runtime.config.timeout));
     let io = TokioIo::new(ActivityIo::new(
@@ -61,50 +105,78 @@ pub async fn serve(
         guard,
         activity,
         cancelled: CancellationToken::new(),
-        upgraded: AtomicBool::new(false),
+        http1_upgraded: AtomicBool::new(false),
     });
     let service_context = context.clone();
-    let service = service_fn(move |request| {
+    let service = service_fn(move |request: Request<Incoming>| {
         let context = service_context.clone();
         async move {
-            let response = match handle(request, context).await {
+            let version = request.version();
+            let mut response = match handle(request, context).await {
                 Ok(response) => response,
-                Err((status, message)) => error_response(status, message),
+                Err((status, message)) => error_response(status, message, version),
             };
+            *response.version_mut() = version;
             Ok::<_, Infallible>(response)
         }
     });
-    let mut builder = hyper::server::conn::http1::Builder::new();
-    builder
-        .timer(TokioTimer::new())
-        .header_read_timeout(Duration::from_secs(runtime.config.header_timeout))
-        .max_buf_size(16 * 1024)
-        .half_close(true);
-    let connection = builder.serve_connection(io, service).with_upgrades();
-    tokio::pin!(connection);
-    let result = tokio::select! {
-        result = &mut connection => result.map_err(Into::into),
-        _ = context.activity.expired() => Ok(()),
-        _ = runtime.force_shutdown.cancelled() => Ok(()),
-        _ = runtime.shutdown.cancelled() => {
-            connection.as_mut().graceful_shutdown();
+    // Both protocol drivers have the same graceful/forced shutdown contract.
+    macro_rules! drive {
+        ($connection:expr) => {{
+            let connection = $connection;
+            tokio::pin!(connection);
             tokio::select! {
-                result = &mut connection => result.map_err(Into::into),
+                result = &mut connection => result.map_err(anyhow::Error::from),
                 _ = context.activity.expired() => Ok(()),
                 _ = runtime.force_shutdown.cancelled() => Ok(()),
+                _ = runtime.shutdown.cancelled() => {
+                    connection.as_mut().graceful_shutdown();
+                    tokio::select! {
+                        result = &mut connection => result.map_err(anyhow::Error::from),
+                        _ = context.activity.expired() => Ok(()),
+                        _ = runtime.force_shutdown.cancelled() => Ok(()),
+                    }
+                }
             }
-        }
+        }};
+    }
+    let result = if h2 {
+        let executor = Executor {
+            tasks: runtime.tasks.clone(),
+            force_shutdown: runtime.force_shutdown.clone(),
+        };
+        let mut builder = hyper::server::conn::http2::Builder::new(executor);
+        builder
+            .timer(TokioTimer::new())
+            .max_concurrent_streams(runtime.config.max_concurrent_streams)
+            .max_header_list_size(16 * 1024)
+            .header_table_size(4096)
+            .max_frame_size(16 * 1024)
+            .initial_stream_window_size(65535)
+            .initial_connection_window_size(1024 * 1024)
+            .max_send_buf_size(64 * 1024)
+            .max_pending_accept_reset_streams(20)
+            .max_local_error_reset_streams(100)
+            .adaptive_window(false);
+        // Ordinary CONNECT works without advertising RFC 8441 extended CONNECT.
+        drive!(builder.serve_connection(io, service))
+    } else {
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_secs(runtime.config.header_timeout))
+            .max_buf_size(16 * 1024)
+            .half_close(true);
+        drive!(builder.serve_connection(io, service).with_upgrades())
     };
-    if !context.upgraded.load(Ordering::Relaxed) {
+    // An H2 CONNECT upgrades ONE stream, never ownership of the connection.
+    if h2 || !context.http1_upgraded.load(Ordering::Relaxed) {
         context.cancelled.cancel();
     }
     result
 }
 
-async fn handle(
-    mut request: Request<Incoming>,
-    context: Arc<Context>,
-) -> HttpResult<Response<Body>> {
+async fn handle(request: Request<Incoming>, context: Arc<Context>) -> HttpResult<Response<Body>> {
     let runtime = &context.runtime;
     runtime.metrics.requests.fetch_add(1, Ordering::Relaxed);
     if !runtime.auth.authenticate(request.headers()) {
@@ -117,6 +189,15 @@ async fn handle(
             "Proxy authentication required",
         ));
     }
+    if request.extensions().get::<hyper::ext::Protocol>().is_some() {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            "Extended CONNECT is not supported",
+        ));
+    }
+    if request.version() == Version::HTTP_2 {
+        validate_h2_headers(request.headers()).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    }
     let target = Target::parse(&request).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let is_connect = request.method() == Method::CONNECT;
     if !runtime
@@ -125,6 +206,48 @@ async fn handle(
     {
         return Err((StatusCode::FORBIDDEN, "Blocked by filter"));
     }
+    if is_connect && !runtime.config.connect_ports.contains(&target.port) {
+        return Err((StatusCode::FORBIDDEN, "CONNECT port not allowed"));
+    }
+    let permit = runtime.requests.clone().try_acquire_owned().map_err(|_| {
+        runtime
+            .metrics
+            .requests_rejected
+            .fetch_add(1, Ordering::Relaxed);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Proxy request capacity reached",
+        )
+    })?;
+    let state = Exchange::new(
+        permit,
+        context.guard.clone(),
+        runtime.metrics.clone(),
+        context.cancelled.child_token(),
+        Duration::from_secs(runtime.config.timeout),
+    );
+    let mut lease = CancelOnDrop(Some(state.clone()));
+    let result = tokio::select! {
+        result = forward(request, target, context.clone(), state.clone()) => result,
+        _ = state.activity.expired() => Err((StatusCode::GATEWAY_TIMEOUT, "Request idle timeout")),
+        _ = state.cancelled.cancelled() => Err((StatusCode::BAD_GATEWAY, "Request cancelled")),
+        _ = runtime.force_shutdown.cancelled() => Err((StatusCode::SERVICE_UNAVAILABLE, "Proxy shutting down")),
+    };
+    if result.is_ok() {
+        lease.0 = None;
+    }
+    result
+}
+
+async fn forward(
+    mut request: Request<Incoming>,
+    target: Target,
+    context: Arc<Context>,
+    state: Arc<Exchange>,
+) -> HttpResult<Response<Body>> {
+    let runtime = &context.runtime;
+    let version = request.version();
+    let is_connect = request.method() == Method::CONNECT;
     if !is_connect && runtime.config.stat_host.as_deref() == Some(target.host.as_str()) {
         if request.method() != Method::GET && request.method() != Method::HEAD {
             return Err((
@@ -132,74 +255,74 @@ async fn handle(
                 "Statistics require GET or HEAD",
             ));
         }
-        return Ok(text_response(
+        let mut response = text_response(
             StatusCode::OK,
             runtime.metrics.to_html(),
             "text/html; charset=utf-8",
-        ));
+        );
+        if request.method() == Method::HEAD {
+            *response.body_mut() = empty_body();
+        }
+        return Ok(response.map(|body| exchange::track(body, state, true)));
     }
     if is_connect {
-        if !runtime.config.connect_ports.contains(&target.port) {
-            return Err((StatusCode::FORBIDDEN, "CONNECT port not allowed"));
-        }
-        // Validate hop-by-hop syntax before switching protocols.
-        strip_hop_by_hop(request.headers_mut())
-            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        strip_hop_by_hop(request.headers_mut()).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
         let target_stream = dial(&target, runtime).await?;
         let upgrade = hyper::upgrade::on(&mut request);
-        context.upgraded.store(true, Ordering::Relaxed);
-        let tunnel_context = context.clone();
+        if version != Version::HTTP_2 {
+            context.http1_upgraded.store(true, Ordering::Relaxed);
+        }
+        let force = runtime.force_shutdown.clone();
         runtime.tasks.spawn(async move {
-            let context = tunnel_context;
             let tunnel = async {
                 let upgraded = upgrade.await?;
-                let mut client = TokioIo::new(upgraded);
-                let mut target = ActivityIo::new(target_stream, context.activity.clone(), None);
-                // Hyper's upgrade preserves bytes read beyond the CONNECT header.
-                // Tokio preserves half-close and finishes the remaining direction.
-                copy_bidirectional(&mut client, &mut target).await?;
+                let mut client =
+                    ActivityIo::new(TokioIo::new(upgraded), state.activity.clone(), None);
+                let mut target = ActivityIo::new(target_stream, state.activity.clone(), None);
+                if version == Version::HTTP_2 {
+                    crate::h2_tunnel::relay(client, target).await?;
+                } else {
+                    copy_bidirectional(&mut client, &mut target).await?;
+                }
                 Ok::<_, BoxError>(())
             };
             tokio::select! {
                 _ = tunnel => {},
-                _ = context.activity.expired() => {},
-                _ = context.runtime.force_shutdown.cancelled() => {},
+                _ = state.activity.expired() => {},
+                _ = state.cancelled.cancelled() => {},
+                _ = force.cancelled() => {},
             }
-            context.cancelled.cancel();
+            state.cancelled.cancel();
         });
-        let mut response = text_response(StatusCode::OK, String::new(), "text/plain");
-        response.headers_mut().remove("content-length");
-        response.headers_mut().remove("content-type");
-        return Ok(response);
+        // No Content-Length or Transfer-Encoding on successful CONNECT.
+        return Ok(Response::new(empty_body()));
     }
     if request.headers().contains_key("upgrade") {
         return Err((StatusCode::NOT_IMPLEMENTED, "HTTP Upgrade is not supported"));
     }
-    strip_hop_by_hop(request.headers_mut())
-        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    strip_hop_by_hop(request.headers_mut()).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    if version == Version::HTTP_2 {
+        coalesce_cookies(request.headers_mut()).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    }
     let target_stream = dial(&target, runtime).await?;
     request.headers_mut().insert(HOST, target.authority);
-    add_via(request.headers_mut(), runtime);
+    add_via(request.headers_mut(), runtime, version);
     *request.uri_mut() = target.path;
     *request.version_mut() = Version::HTTP_11;
-
-    let io = TokioIo::new(ActivityIo::new(
-        target_stream,
-        context.activity.clone(),
-        None,
-    ));
+    request.extensions_mut().clear();
+    let request = request.map(|body| exchange::track(body, state.clone(), false));
+    let io = TokioIo::new(ActivityIo::new(target_stream, state.activity.clone(), None));
     let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
         .await
         .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream handshake failed"))?;
-    let driver_context = context.clone();
+    let driver_state = state.clone();
+    let force = runtime.force_shutdown.clone();
     runtime.tasks.spawn(async move {
-        // Keep the connection permit until this socket has also been released.
-        let _guard = driver_context.guard.clone();
         tokio::select! {
             _ = connection => {},
-            _ = driver_context.activity.expired() => {},
-            _ = driver_context.cancelled.cancelled() => {},
-            _ = driver_context.runtime.force_shutdown.cancelled() => {},
+            _ = driver_state.activity.expired() => {},
+            _ = driver_state.cancelled.cancelled() => {},
+            _ = force.cancelled() => {},
         }
     });
     let mut response = sender
@@ -209,13 +332,10 @@ async fn handle(
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
         return Err((StatusCode::BAD_GATEWAY, "Unexpected upstream upgrade"));
     }
-    strip_hop_by_hop(response.headers_mut())
-        .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
-    add_via(response.headers_mut(), runtime);
-    Ok(response.map(|body| {
-        body.map_err(|error| -> BoxError { Box::new(error) })
-            .boxed_unsync()
-    }))
+    let upstream_version = response.version();
+    strip_hop_by_hop(response.headers_mut()).map_err(|m| (StatusCode::BAD_GATEWAY, m))?;
+    add_via(response.headers_mut(), runtime, upstream_version);
+    Ok(response.map(|body| exchange::track(body, state, true)))
 }
 
 async fn dial(target: &Target, runtime: &Runtime) -> HttpResult<TcpStream> {
@@ -242,7 +362,6 @@ struct Target {
     path: Uri,
     url: String,
 }
-
 impl Target {
     fn parse<B>(request: &Request<B>) -> std::result::Result<Self, &'static str> {
         let connect = request.method() == Method::CONNECT;
@@ -268,7 +387,7 @@ impl Target {
             request
                 .headers()
                 .get(HOST)
-                .and_then(|value| value.to_str().ok())
+                .and_then(|v| v.to_str().ok())
                 .ok_or("Host header required")?
                 .parse::<hyper::http::uri::Authority>()
                 .map_err(|_| "Invalid Host header")?
@@ -290,6 +409,21 @@ impl Target {
         } else {
             80
         };
+        // H2 :authority and Host cannot name different destinations.
+        if request.version() == Version::HTTP_2 {
+            if let Some(host) = request.headers().get(HOST) {
+                let host = host
+                    .to_str()
+                    .map_err(|_| "Invalid Host header")?
+                    .parse::<hyper::http::uri::Authority>()
+                    .map_err(|_| "Invalid Host header")?;
+                if !host.host().eq_ignore_ascii_case(authority.host())
+                    || host.port_u16().unwrap_or(80) != port
+                {
+                    return Err("Host disagrees with :authority");
+                }
+            }
+        }
         let host = authority
             .host()
             .trim_start_matches('[')
@@ -299,10 +433,7 @@ impl Target {
         if host.is_empty() {
             return Err("Empty destination host");
         }
-        let path = uri
-            .path_and_query()
-            .map(|path| path.as_str())
-            .unwrap_or("/");
+        let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
         if !connect
             && !path.starts_with('/')
             && !(path == "*" && request.method() == Method::OPTIONS)
@@ -319,7 +450,44 @@ impl Target {
     }
 }
 
-fn strip_hop_by_hop(headers: &mut HeaderMap) -> std::result::Result<(), &'static str> {
+fn validate_h2_headers(headers: &HeaderMap) -> std::result::Result<(), &'static str> {
+    for name in [
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        if headers.contains_key(name) {
+            return Err("Connection-specific field in HTTP/2");
+        }
+    }
+    for value in headers.get_all("te") {
+        if !value.as_bytes().eq_ignore_ascii_case(b"trailers") {
+            return Err("HTTP/2 TE must be trailers");
+        }
+    }
+    Ok(())
+}
+
+/// RFC 9113 section 8.2.3 requires split Cookie fields to be joined using '; '.
+fn coalesce_cookies(headers: &mut HeaderMap) -> std::result::Result<(), &'static str> {
+    if headers.get_all(COOKIE).iter().count() < 2 {
+        return Ok(());
+    }
+    let mut joined = Vec::new();
+    for (index, cookie) in headers.get_all(COOKIE).iter().enumerate() {
+        if index != 0 {
+            joined.extend_from_slice(b"; ");
+        }
+        joined.extend_from_slice(cookie.as_bytes());
+    }
+    let value = HeaderValue::from_bytes(&joined).map_err(|_| "Invalid Cookie")?;
+    headers.insert(COOKIE, value);
+    Ok(())
+}
+
+pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) -> std::result::Result<(), &'static str> {
     if headers.contains_key("content-length") && headers.contains_key("transfer-encoding") {
         return Err("Ambiguous message framing");
     }
@@ -358,19 +526,27 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) -> std::result::Result<(), &'static
     ] {
         headers.remove(name);
     }
-    // Hyper decodes and re-encodes body framing. Never blindly relay raw bytes
-    // after the first HTTP request; only CONNECT uses a byte tunnel.
     Ok(())
 }
 
-fn add_via(headers: &mut HeaderMap, runtime: &Runtime) {
+fn add_via(headers: &mut HeaderMap, runtime: &Runtime, version: Version) {
     if !runtime.config.disable_via_header {
-        let value = HeaderValue::from_str(&format!("1.1 {}", runtime.config.via_proxy_name))
-            .expect("startup-validated ViaProxyName");
+        let protocol = match version {
+            Version::HTTP_2 => "2",
+            Version::HTTP_10 => "1.0",
+            _ => "1.1",
+        };
+        let value =
+            HeaderValue::from_str(&format!("{} {}", protocol, runtime.config.via_proxy_name))
+                .expect("startup-validated ViaProxyName");
         headers.append(VIA, value);
     }
 }
-
+fn empty_body() -> Body {
+    Full::new(Bytes::new())
+        .map_err(|never| -> BoxError { match never {} })
+        .boxed_unsync()
+}
 fn text_response(status: StatusCode, text: String, content_type: &'static str) -> Response<Body> {
     let length = text.len();
     let body = Full::new(Bytes::from(text))
@@ -387,16 +563,17 @@ fn text_response(status: StatusCode, text: String, content_type: &'static str) -
     );
     response
 }
-
-fn error_response(status: StatusCode, message: &'static str) -> Response<Body> {
+fn error_response(status: StatusCode, message: &'static str, version: Version) -> Response<Body> {
     let mut response = text_response(
         status,
         format!("{}\n", message),
         "text/plain; charset=utf-8",
     );
-    response
-        .headers_mut()
-        .insert(CONNECTION, HeaderValue::from_static("close"));
+    if version != Version::HTTP_2 {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
     if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         response.headers_mut().insert(
             PROXY_AUTHENTICATE,

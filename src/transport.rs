@@ -31,8 +31,7 @@ impl Activity {
             idle,
         }
     }
-
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         let elapsed = self
             .state
             .started
@@ -41,15 +40,12 @@ impl Activity {
             .min(u64::MAX as u128) as u64;
         self.state.last_millis.fetch_max(elapsed, Ordering::Relaxed);
     }
-
     fn deadline(&self) -> Instant {
         self.state.started
             + Duration::from_millis(self.state.last_millis.load(Ordering::Relaxed))
             + self.idle
     }
-
-    /// Progress in either direction resets idle time; this is not a maximum
-    /// connection lifetime. No timer is allocated or reset per byte transfer.
+    /// Progress in either direction resets idle time, not maximum lifetime.
     pub async fn expired(&self) {
         loop {
             sleep_until(self.deadline()).await;
@@ -65,7 +61,6 @@ pub struct ActivityIo<T> {
     activity: Activity,
     metrics: Option<Arc<Metrics>>,
 }
-
 impl<T> ActivityIo<T> {
     pub fn new(inner: T, activity: Activity, metrics: Option<Arc<Metrics>>) -> Self {
         Self {
@@ -75,7 +70,6 @@ impl<T> ActivityIo<T> {
         }
     }
 }
-
 impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -96,7 +90,6 @@ impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
         result
     }
 }
-
 impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -116,11 +109,9 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
         }
         result
     }
-
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
-
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }

@@ -24,7 +24,12 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
   test:
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -37,3 +42,6 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo build --release --locked
       - run: ./target/release/tinyproxy-rust --check -c config/tinyproxy-rust.conf
+      - name: Verify TLS and HTTP2 interoperability with curl
+        if: runner.os == 'Linux'
+        run: python3 scripts/test_curl_proxy.py --curl /usr/bin/curl

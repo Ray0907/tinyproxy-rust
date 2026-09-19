@@ -16,16 +16,20 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper = { version = "1.11.1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 ipnet = "2"
 log = "0.4"
 regex = "1"
+rustls-pemfile = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 criterion = "0.5"
+h2 = "0.4"
+rcgen = "0.13"
 tempfile = "3"
 
 [[bench]]

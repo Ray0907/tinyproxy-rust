@@ -1,0 +1,25 @@
+# Optional TLS-only HTTP/1 + HTTP/2 listener.
+# Copy to your own configuration and supply a certificate/key for the proxy
+# hostname. Relative paths are resolved from this file's directory.
+# This example is loopback-only and does not expose a public proxy.
+Listen 127.0.0.1
+Port 8888
+
+TLSCert certs/proxy-cert.pem
+TLSKey certs/proxy-key.pem
+TLSHandshakeTimeout 10
+HTTP2 Yes
+
+MaxClients 100
+MaxConcurrentStreams 32
+MaxInflightRequests 256
+Timeout 600
+HeaderTimeout 30
+ConnectTimeout 30
+ShutdownTimeout 5
+ConnectPort 443
+LogLevel Info
+
+# For remote clients, configure specific Allow/Deny rules and/or BasicAuth
+# before changing Listen. Protect the key and configuration permissions.
+# Do not enable AllowH2C here: TLS uses ALPN, not plaintext protocol detection.

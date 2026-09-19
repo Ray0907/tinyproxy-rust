@@ -1,0 +1,3 @@
+# Deployment certificates and private keys are never repository assets.
+*
+!.gitignore
