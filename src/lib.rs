@@ -7,6 +7,8 @@ pub mod connection;
 mod exchange;
 pub mod filter;
 mod h2_tunnel;
+#[cfg(test)]
+mod io_tests;
 mod protocol;
 pub mod runtime;
 pub mod server;

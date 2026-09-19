@@ -69,6 +69,19 @@ impl<T> ActivityIo<T> {
             metrics,
         }
     }
+
+    fn record_write(&self, result: &Poll<io::Result<usize>>) {
+        if let Poll::Ready(Ok(count)) = result {
+            if *count > 0 {
+                self.activity.touch();
+                if let Some(metrics) = &self.metrics {
+                    metrics
+                        .bytes_out
+                        .fetch_add(*count as u64, Ordering::Relaxed);
+                }
+            }
+        }
+    }
 }
 impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
     fn poll_read(
@@ -97,17 +110,22 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let result = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(count)) = &result {
-            if *count > 0 {
-                self.activity.touch();
-                if let Some(metrics) = &self.metrics {
-                    metrics
-                        .bytes_out
-                        .fetch_add(*count as u64, Ordering::Relaxed);
-                }
-            }
-        }
+        self.record_write(&result);
         result
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        // Delegate once: partial writes must not be followed by another write
+        // that could turn an accepted prefix into Pending or an error.
+        let result = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.record_write(&result);
+        result
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
@@ -115,6 +133,13 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
+}
+
+/// Avoid delaying response/control frames on the client-facing connection,
+/// including before TLS negotiation. Upstream sockets deliberately keep their
+/// existing buffering policy; blanket NODELAY regressed bulk-transfer tests.
+pub(crate) fn configure_client_socket(stream: &TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)
 }
 
 pub async fn connect(
@@ -151,4 +176,30 @@ pub async fn connect(
     })
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS/connect deadline exceeded"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn accepted_socket_disables_nagle() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let _client = TcpStream::connect(listener.local_addr()?).await?;
+        let (accepted, _) = listener.accept().await?;
+        configure_client_socket(&accepted)?;
+        assert!(accepted.nodelay()?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn outgoing_sockets_keep_buffering_with_and_without_bind() -> io::Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        for bind in [None, Some("127.0.0.1".parse().unwrap())] {
+            let stream = connect("127.0.0.1", listener.local_addr()?.port(), bind, 2).await?;
+            assert!(!stream.nodelay()?);
+        }
+        Ok(())
+    }
 }

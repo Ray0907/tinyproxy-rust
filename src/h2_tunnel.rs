@@ -29,7 +29,9 @@ where
         let period = Duration::from_millis(250);
         let mut check = interval_at(Instant::now() + period, period);
         check.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut buffer = [0u8; 8192];
+        // Keep the backing buffer out of the nested async state machines.
+        // Capacity stays bounded at 8 KiB; this does not buffer a whole body.
+        let mut buffer = vec![0u8; 8192];
         let mut count = 0u64;
         loop {
             tokio::select! {
@@ -50,4 +52,20 @@ where
         }
     };
     tokio::try_join!(upload, download)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relay_future_does_not_embed_bulk_buffers() {
+        let (client, _client_peer) = tokio::io::duplex(64);
+        let (target, _target_peer) = tokio::io::duplex(64);
+        let future = relay(client, target);
+        assert!(
+            std::mem::size_of_val(&future) < 4096,
+            "relay future unexpectedly embeds a bulk buffer"
+        );
+    }
 }
