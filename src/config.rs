@@ -82,20 +82,21 @@ impl Config {
             .with_context(|| format!("Cannot read configuration: {}", path.display()))?;
         let mut config = Self::parse(&text)?;
         // All policy and TLS paths are relative to the configuration, not cwd.
-        for file in [
+        for value in [
             &mut config.filter_file,
             &mut config.tls_cert,
             &mut config.tls_key,
-        ] {
-            if let Some(value) = file {
-                if Path::new(value).is_relative() {
-                    *value = path
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .join(&*value)
-                        .to_string_lossy()
-                        .into_owned();
-                }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if Path::new(value).is_relative() {
+                *value = path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(&*value)
+                    .to_string_lossy()
+                    .into_owned();
             }
         }
         Ok(config)
