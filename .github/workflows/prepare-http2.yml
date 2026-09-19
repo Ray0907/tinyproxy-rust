@@ -1,0 +1,31 @@
+name: Prepare HTTP2 branch
+on:
+  push:
+    branches: [feat/http2-proxy]
+    paths: [Cargo.toml, src/**, tests/**]
+permissions:
+  contents: write
+jobs:
+  prepare:
+    if: github.ref == 'refs/heads/feat/http2-proxy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Normalize source and lock dependencies on this feature branch only
+        run: |
+          cargo generate-lockfile
+          cargo fmt --all
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.lock src tests
+          if ! git diff --cached --quiet; then
+            git commit -m 'build: lock HTTP2 TLS dependencies and format sources'
+            git push origin HEAD:feat/http2-proxy
+          fi
+      - run: cargo test --all-targets --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo build --release --locked
