@@ -26,9 +26,21 @@ pub struct Exchange {
 }
 
 impl Exchange {
-    pub fn new(permit: OwnedSemaphorePermit, connection: Arc<ConnectionGuard>, metrics: Arc<Metrics>, cancelled: CancellationToken, idle: Duration) -> Arc<Self> {
+    pub fn new(
+        permit: OwnedSemaphorePermit,
+        connection: Arc<ConnectionGuard>,
+        metrics: Arc<Metrics>,
+        cancelled: CancellationToken,
+        idle: Duration,
+    ) -> Arc<Self> {
         metrics.inflight.fetch_add(1, Ordering::Relaxed);
-        Arc::new(Self { activity: Activity::new(idle), cancelled, _permit: permit, _connection: connection, metrics })
+        Arc::new(Self {
+            activity: Activity::new(idle),
+            cancelled,
+            _permit: permit,
+            _connection: connection,
+            metrics,
+        })
     }
 }
 
@@ -61,13 +73,21 @@ where
     B: HttpBody<Data = Bytes> + Send + 'static,
     B::Error: Into<BoxError>,
 {
-    TrackedBody { inner: body.map_err(Into::into).boxed_unsync(), state, cancel_on_drop }.boxed_unsync()
+    TrackedBody {
+        inner: body.map_err(Into::into).boxed_unsync(),
+        state,
+        cancel_on_drop,
+    }
+    .boxed_unsync()
 }
 
 impl HttpBody for TrackedBody {
     type Data = Bytes;
     type Error = BoxError;
-    fn poll_frame(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let result = Pin::new(&mut self.inner).poll_frame(cx);
         match result {
             Poll::Ready(Some(Ok(mut frame))) => {
@@ -78,7 +98,11 @@ impl HttpBody for TrackedBody {
                 // hop-by-hop fields after the initial header sanitization.
                 if let Some(trailers) = frame.trailers_mut() {
                     if crate::connection::strip_hop_by_hop(trailers).is_err() {
-                        return Poll::Ready(Some(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid HTTP trailers").into())));
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid HTTP trailers",
+                        )
+                        .into())));
                     }
                     for name in ["host", "content-length", "authorization", "cookie"] {
                         trailers.remove(name);
@@ -89,8 +113,12 @@ impl HttpBody for TrackedBody {
             other => other,
         }
     }
-    fn is_end_stream(&self) -> bool { self.inner.is_end_stream() }
-    fn size_hint(&self) -> SizeHint { self.inner.size_hint() }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 impl Drop for TrackedBody {

@@ -32,7 +32,12 @@ impl Proxy {
         let address = proxy.local_addresses()?[0];
         let shutdown = proxy.shutdown_token();
         let metrics = proxy.metrics();
-        Ok(Self { address, shutdown, metrics, task: tokio::spawn(proxy.run()) })
+        Ok(Self {
+            address,
+            shutdown,
+            metrics,
+            task: tokio::spawn(proxy.run()),
+        })
     }
     async fn stop(mut self) -> Result<()> {
         self.shutdown.cancel();
@@ -43,42 +48,77 @@ impl Proxy {
     }
 }
 impl Drop for Proxy {
-    fn drop(&mut self) { self.shutdown.cancel(); self.task.abort(); }
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.task.abort();
+    }
 }
 fn config() -> Config {
-    Config { port: 0, allow_h2c: true, shutdown_timeout: 1, ..Config::default() }
+    Config {
+        port: 0,
+        allow_h2c: true,
+        shutdown_timeout: 1,
+        ..Config::default()
+    }
 }
 
-struct Client { sender: SendRequest<Bytes>, driver: JoinHandle<()> }
+struct Client {
+    sender: SendRequest<Bytes>,
+    driver: JoinHandle<()>,
+}
 impl Client {
     async fn new<T>(io: T) -> Result<Self>
-    where T: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    where
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (sender, connection) = h2::client::handshake(io).await?;
-        let driver = tokio::spawn(async move { let _ = connection.await; });
+        let driver = tokio::spawn(async move {
+            let _ = connection.await;
+        });
         Ok(Self { sender, driver })
     }
-    async fn plain(proxy: &Proxy) -> Result<Self> { Self::new(TcpStream::connect(proxy.address).await?).await }
-    async fn send(&self, request: Request<()>, end: bool) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>)> {
+    async fn plain(proxy: &Proxy) -> Result<Self> {
+        Self::new(TcpStream::connect(proxy.address).await?).await
+    }
+    async fn send(
+        &self,
+        request: Request<()>,
+        end: bool,
+    ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>)> {
         let mut sender = timeout(WAIT, self.sender.clone().ready()).await??;
         Ok(sender.send_request(request, end)?)
     }
     async fn get(&self, uri: String) -> Result<Response<h2::RecvStream>> {
-        let request = Request::builder().version(Version::HTTP_2).uri(uri).body(())?;
+        let request = Request::builder()
+            .version(Version::HTTP_2)
+            .uri(uri)
+            .body(())?;
         let (response, _) = self.send(request, true).await?;
         Ok(timeout(WAIT, response).await??)
     }
     async fn tunnel(&self, target: SocketAddr) -> Result<(h2::SendStream<Bytes>, h2::RecvStream)> {
-        let request = Request::builder().version(Version::HTTP_2).method(Method::CONNECT)
-            .uri(target.to_string()).body(())?;
+        let request = Request::builder()
+            .version(Version::HTTP_2)
+            .method(Method::CONNECT)
+            .uri(target.to_string())
+            .body(())?;
         let (response, send) = self.send(request, false).await?;
         let response = timeout(WAIT, response).await??;
-        ensure!(response.status() == 200, "CONNECT failed: {}", response.status());
+        ensure!(
+            response.status() == 200,
+            "CONNECT failed: {}",
+            response.status()
+        );
         ensure!(!response.headers().contains_key("content-length"));
         ensure!(!response.headers().contains_key("connection"));
         Ok((send, response.into_body()))
     }
 }
-impl Drop for Client { fn drop(&mut self) { self.driver.abort(); } }
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
 
 async fn collect(mut body: h2::RecvStream) -> Result<Vec<u8>> {
     timeout(WAIT, async {
@@ -90,7 +130,8 @@ async fn collect(mut body: h2::RecvStream) -> Result<Vec<u8>> {
             body.flow_control().release_capacity(count)?;
         }
         Ok(result)
-    }).await?
+    })
+    .await?
 }
 async fn header<T: AsyncRead + Unpin>(io: &mut T) -> Result<String> {
     timeout(WAIT, async {
@@ -100,12 +141,16 @@ async fn header<T: AsyncRead + Unpin>(io: &mut T) -> Result<String> {
             ensure!(bytes.len() < 65536);
         }
         Ok(String::from_utf8(bytes)?)
-    }).await?
+    })
+    .await?
 }
 async fn inflight(proxy: &Proxy, count: u64) -> Result<()> {
     timeout(WAIT, async {
-        while proxy.metrics.inflight.load(Ordering::Relaxed) != count { sleep(Duration::from_millis(5)).await; }
-    }).await?;
+        while proxy.metrics.inflight.load(Ordering::Relaxed) != count {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
     Ok(())
 }
 
@@ -157,11 +202,22 @@ impl Origin {
                 }
             }
         });
-        Ok(Self { address, task, blocked, release })
+        Ok(Self {
+            address,
+            task,
+            blocked,
+            release,
+        })
     }
-    fn url(&self, path: &str) -> String { format!("http://{}{}", self.address, path) }
+    fn url(&self, path: &str) -> String {
+        format!("http://{}{}", self.address, path)
+    }
 }
-impl Drop for Origin { fn drop(&mut self) { self.task.abort(); } }
+impl Drop for Origin {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 struct Certificate {
     _directory: tempfile::TempDir,
@@ -177,16 +233,35 @@ impl Certificate {
         let key = directory.path().join("key.pem");
         std::fs::write(&cert, generated.cert.pem())?;
         std::fs::write(&key, generated.key_pair.serialize_pem())?;
-        Ok(Self { _directory: directory, cert: cert.to_string_lossy().into_owned(), key: key.to_string_lossy().into_owned(), der: generated.cert.der().clone() })
+        Ok(Self {
+            _directory: directory,
+            cert: cert.to_string_lossy().into_owned(),
+            key: key.to_string_lossy().into_owned(),
+            der: generated.cert.der().clone(),
+        })
     }
     fn config(&self) -> Config {
-        Config { port: 0, tls_cert: Some(self.cert.clone()), tls_key: Some(self.key.clone()), shutdown_timeout: 1, ..Config::default() }
+        Config {
+            port: 0,
+            tls_cert: Some(self.cert.clone()),
+            tls_key: Some(self.key.clone()),
+            shutdown_timeout: 1,
+            ..Config::default()
+        }
     }
-    async fn connect(&self, proxy: &Proxy, alpn: &[&[u8]]) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    async fn connect(
+        &self,
+        proxy: &Proxy,
+        alpn: &[&[u8]],
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let mut roots = rustls::RootCertStore::empty();
         roots.add(self.der.clone())?;
-        let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()?.with_root_certificates(roots).with_no_client_auth();
+        let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
         client.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
         let connector = TlsConnector::from(Arc::new(client));
         let tcp = TcpStream::connect(proxy.address).await?;
@@ -217,7 +292,11 @@ async fn tls_supports_http1_alpn_and_no_alpn_fallback() -> Result<()> {
     let origin = Origin::new("http1").await?;
     for alpn in [vec![b"http/1.1".as_slice()], vec![]] {
         let mut tls = certificate.connect(&proxy, &alpn).await?;
-        let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", origin.url("/"), origin.address);
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            origin.url("/"),
+            origin.address
+        );
         tls.write_all(request.as_bytes()).await?;
         let head = header(&mut tls).await?;
         assert!(head.starts_with("HTTP/1.1 200"));
@@ -235,7 +314,10 @@ async fn disabling_http2_excludes_it_from_alpn() -> Result<()> {
     config.http2 = false;
     let proxy = Proxy::new(config).await?;
     let tls = certificate.connect(&proxy, &[b"h2", b"http/1.1"]).await?;
-    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"http/1.1".as_slice()));
+    assert_eq!(
+        tls.get_ref().1.alpn_protocol(),
+        Some(b"http/1.1".as_slice())
+    );
     drop(tls);
     proxy.stop().await
 }
@@ -254,14 +336,29 @@ async fn h2c_is_explicit_and_http1_still_works_on_the_same_port() -> Result<()> 
     let proxy = Proxy::new(config()).await?;
     let origin = Origin::new("shared-port").await?;
     let client = Client::plain(&proxy).await?;
-    assert_eq!(collect(client.get(origin.url("/")).await?.into_body()).await?, b"shared-port");
+    assert_eq!(
+        collect(client.get(origin.url("/")).await?.into_body()).await?,
+        b"shared-port"
+    );
     let mut tcp = TcpStream::connect(proxy.address).await?;
-    tcp.write_all(format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", origin.url("/"), origin.address).as_bytes()).await?;
+    tcp.write_all(
+        format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            origin.url("/"),
+            origin.address
+        )
+        .as_bytes(),
+    )
+    .await?;
     assert!(header(&mut tcp).await?.starts_with("HTTP/1.1 200"));
     drop(tcp);
     drop(client);
     proxy.stop().await?;
-    let proxy = Proxy::new(Config { port: 0, ..Config::default() }).await?;
+    let proxy = Proxy::new(Config {
+        port: 0,
+        ..Config::default()
+    })
+    .await?;
     let client = Client::plain(&proxy).await?;
     assert!(client.get(origin.url("/")).await.is_err());
     drop(client);
@@ -276,9 +373,15 @@ async fn multiplexing_does_not_serialize_a_fast_request_behind_a_blocked_one() -
     let blocked = Request::builder().uri(origin.url("/blocked")).body(())?;
     let (slow, _) = client.send(blocked, true).await?;
     timeout(WAIT, origin.blocked.notified()).await?;
-    assert_eq!(collect(client.get(origin.url("/fast")).await?.into_body()).await?, b"ok");
+    assert_eq!(
+        collect(client.get(origin.url("/fast")).await?.into_body()).await?,
+        b"ok"
+    );
     origin.release.notify_one();
-    assert_eq!(collect(timeout(WAIT, slow).await??.into_body()).await?, b"ok");
+    assert_eq!(
+        collect(timeout(WAIT, slow).await??.into_body()).await?,
+        b"ok"
+    );
     drop(client);
     proxy.stop().await
 }
@@ -308,10 +411,13 @@ async fn h2_auth_is_per_stream_and_translation_preserves_http_semantics() -> Res
     assert_eq!(denied.status(), 407);
     assert!(!denied.headers().contains_key("connection"));
     collect(denied.into_body()).await?;
-    let request = Request::builder().uri(origin.url("/headers?q=1"))
+    let request = Request::builder()
+        .uri(origin.url("/headers?q=1"))
         .header("proxy-authorization", "Basic dXNlcjpwYXNz")
         .header("authorization", "Bearer origin-token")
-        .header("cookie", "a=1").header("cookie", "b=2").body(())?;
+        .header("cookie", "a=1")
+        .header("cookie", "b=2")
+        .body(())?;
     let (response, _) = client.send(request, true).await?;
     let response = timeout(WAIT, response).await??;
     assert_eq!(response.status(), 200);
@@ -334,10 +440,15 @@ async fn host_authority_conflicts_are_not_forwarded() -> Result<()> {
     let origin = Origin::new("origin").await?;
     let proxy = Proxy::new(config()).await?;
     let client = Client::plain(&proxy).await?;
-    let request = Request::builder().uri(origin.url("/")).header("host", "different.invalid").body(())?;
+    let request = Request::builder()
+        .uri(origin.url("/"))
+        .header("host", "different.invalid")
+        .body(())?;
     let (response, _) = client.send(request, true).await?;
     // The protocol library may reject earlier than the application layer.
-    if let Ok(response) = timeout(WAIT, response).await? { assert_eq!(response.status(), 400); }
+    if let Ok(response) = timeout(WAIT, response).await? {
+        assert_eq!(response.status(), 400);
+    }
     drop(client);
     proxy.stop().await
 }
@@ -348,8 +459,11 @@ async fn large_h2_upload_and_response_cross_flow_control_windows() -> Result<()>
     let proxy = Proxy::new(config()).await?;
     let client = Client::plain(&proxy).await?;
     let body = Bytes::from(vec![0x5a; 2 * 1024 * 1024]);
-    let request = Request::builder().method(Method::POST).uri(origin.url("/echo"))
-        .header("content-length", body.len()).body(())?;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(origin.url("/echo"))
+        .header("content-length", body.len())
+        .body(())?;
     let (response, mut send) = client.send(request, false).await?;
     // h2 buffers test input; production uses bounded Hyper streaming bodies.
     send.send_data(body.clone(), true)?;
@@ -370,7 +484,10 @@ async fn h2_connect_preserves_early_data_half_close_and_sibling_streams() -> Res
     config.connect_ports = vec![aa.port(), bb.port()];
     let proxy = Proxy::new(config).await?;
     let client = Client::plain(&proxy).await?;
-    let request = Request::builder().method(Method::CONNECT).uri(aa.to_string()).body(())?;
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(aa.to_string())
+        .body(())?;
     let (response, mut send_a) = client.send(request, false).await?;
     send_a.send_data(Bytes::from_static(b"early"), true)?;
     let response = timeout(WAIT, response).await??;
@@ -392,7 +509,10 @@ async fn h2_connect_preserves_early_data_half_close_and_sibling_streams() -> Res
     up_b.shutdown().await?;
     assert_eq!(collect(recv_b).await?, b"sibling-ok");
     let origin = Origin::new("still-h2").await?;
-    assert_eq!(collect(client.get(origin.url("/")).await?.into_body()).await?, b"still-h2");
+    assert_eq!(
+        collect(client.get(origin.url("/")).await?.into_body()).await?,
+        b"still-h2"
+    );
     drop(client);
     proxy.stop().await
 }
@@ -415,7 +535,10 @@ async fn global_request_budget_includes_connect_and_recovers_after_reset() -> Re
     drop(recv);
     assert!(timeout(WAIT, upstream.read_u8()).await?.is_err());
     inflight(&proxy, 0).await?;
-    assert_eq!(collect(client.get(origin.url("/")).await?.into_body()).await?, b"recovered");
+    assert_eq!(
+        collect(client.get(origin.url("/")).await?.into_body()).await?,
+        b"recovered"
+    );
     drop(client);
     proxy.stop().await
 }
@@ -425,7 +548,9 @@ async fn reset_before_response_headers_closes_the_upstream_socket() -> Result<()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy = Proxy::new(config()).await?;
     let client = Client::plain(&proxy).await?;
-    let request = Request::builder().uri(format!("http://{}/", listener.local_addr()?)).body(())?;
+    let request = Request::builder()
+        .uri(format!("http://{}/", listener.local_addr()?))
+        .body(())?;
     let (response, mut send) = client.send(request, true).await?;
     let (mut upstream, _) = timeout(WAIT, listener.accept()).await??;
     header(&mut upstream).await?;
@@ -455,13 +580,18 @@ async fn busy_sibling_does_not_keep_an_idle_tunnel_alive() -> Result<()> {
         active_send.send_data(Bytes::from_static(b"a"), false)?;
         assert_eq!(timeout(WAIT, active_upstream.read_u8()).await??, b'a');
         active_upstream.write_all(b"b").await?;
-        let data = timeout(WAIT, active_recv.data()).await?.transpose()?.unwrap();
+        let data = timeout(WAIT, active_recv.data())
+            .await?
+            .transpose()?
+            .unwrap();
         assert_eq!(data, b"b".as_slice());
         active_recv.flow_control().release_capacity(data.len())?;
     }
     assert!(timeout(WAIT, idle_upstream.read_u8()).await?.is_err());
     let end = timeout(WAIT, idle_recv.data()).await?;
-    assert!(end.is_none() || end.is_some_and(|data| data.is_err() || data.is_ok_and(|b| b.is_empty())));
+    assert!(
+        end.is_none() || end.is_some_and(|data| data.is_err() || data.is_ok_and(|b| b.is_empty()))
+    );
     inflight(&proxy, 1).await?;
     active_send.send_reset(h2::Reason::CANCEL);
     drop(active_recv);
@@ -481,7 +611,11 @@ async fn max_concurrent_streams_is_advertised_and_enforced() -> Result<()> {
     let (mut send, recv) = client.tunnel(target).await?;
     let (_upstream, _) = timeout(WAIT, listener.accept()).await??;
     // Server settings have arrived by the successful CONNECT response.
-    assert!(timeout(Duration::from_millis(100), client.sender.clone().ready()).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(100), client.sender.clone().ready())
+            .await
+            .is_err()
+    );
     send.send_reset(h2::Reason::CANCEL);
     drop(recv);
     timeout(WAIT, client.sender.clone().ready()).await??;
@@ -522,7 +656,9 @@ async fn partial_h2_preface_has_a_total_deadline() -> Result<()> {
     tcp.write_all(b"PRI ").await?;
     sleep(Duration::from_millis(600)).await;
     tcp.write_all(b"*").await?;
-    assert!(timeout(Duration::from_secs(2), tcp.read_u8()).await?.is_err());
+    assert!(timeout(Duration::from_secs(2), tcp.read_u8())
+        .await?
+        .is_err());
     proxy.stop().await
 }
 
@@ -533,16 +669,31 @@ async fn tls_handshake_deadline_releases_connection_capacity() -> Result<()> {
     config.tls_handshake_timeout = 1;
     let proxy = Proxy::new(config).await?;
     let mut tcp = TcpStream::connect(proxy.address).await?;
-    assert!(timeout(Duration::from_secs(3), tcp.read_u8()).await?.is_err());
+    assert!(timeout(Duration::from_secs(3), tcp.read_u8())
+        .await?
+        .is_err());
     proxy.stop().await
 }
 
 #[test]
 fn http2_tls_configuration_rejects_inconsistent_or_unbounded_settings() -> Result<()> {
-    for text in ["MaxConcurrentStreams 0", "MaxConcurrentStreams 1025", "MaxInflightRequests 0", "TLSCert cert.pem", "TLSKey key.pem", "HTTP2 No\nAllowH2C Yes", "TLSHandshakeTimeout 0", "TLSCert a\nTLSKey b\nAllowH2C Yes"] {
-        assert!(Config::parse(text).is_err(), "accepted invalid configuration: {text}");
+    for text in [
+        "MaxConcurrentStreams 0",
+        "MaxConcurrentStreams 1025",
+        "MaxInflightRequests 0",
+        "TLSCert cert.pem",
+        "TLSKey key.pem",
+        "HTTP2 No\nAllowH2C Yes",
+        "TLSHandshakeTimeout 0",
+        "TLSCert a\nTLSKey b\nAllowH2C Yes",
+    ] {
+        assert!(
+            Config::parse(text).is_err(),
+            "accepted invalid configuration: {text}"
+        );
     }
-    let config = Config::parse("HTTP2 Yes\nAllowH2C Yes\nMaxConcurrentStreams 8\nMaxInflightRequests 32")?;
+    let config =
+        Config::parse("HTTP2 Yes\nAllowH2C Yes\nMaxConcurrentStreams 8\nMaxInflightRequests 32")?;
     assert!(config.http2 && config.allow_h2c);
     assert_eq!(config.max_concurrent_streams, 8);
     assert_eq!(config.max_inflight_requests, 32);
@@ -568,7 +719,13 @@ fn tls_paths_resolve_relative_to_configuration() -> Result<()> {
     let path = directory.path().join("proxy.conf");
     std::fs::write(&path, "TLSCert cert.pem\nTLSKey key.pem\n")?;
     let config = Config::from_file(&path)?;
-    assert_eq!(config.tls_cert.as_deref(), directory.path().join("cert.pem").to_str());
-    assert_eq!(config.tls_key.as_deref(), directory.path().join("key.pem").to_str());
+    assert_eq!(
+        config.tls_cert.as_deref(),
+        directory.path().join("cert.pem").to_str()
+    );
+    assert_eq!(
+        config.tls_key.as_deref(),
+        directory.path().join("key.pem").to_str()
+    );
     Ok(())
 }

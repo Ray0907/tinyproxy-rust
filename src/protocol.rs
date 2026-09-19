@@ -17,10 +17,24 @@ pub async fn detect(mut io: BoxIo) -> io::Result<(bool, BoxIo)> {
         let actual = io.read_u8().await?;
         prefix.push(actual);
         if actual != *expected {
-            return Ok((false, Box::new(PrefixedIo { io, prefix, offset: 0 })));
+            return Ok((
+                false,
+                Box::new(PrefixedIo {
+                    io,
+                    prefix,
+                    offset: 0,
+                }),
+            ));
         }
     }
-    Ok((true, Box::new(PrefixedIo { io, prefix, offset: 0 })))
+    Ok((
+        true,
+        Box::new(PrefixedIo {
+            io,
+            prefix,
+            offset: 0,
+        }),
+    ))
 }
 
 struct PrefixedIo {
@@ -30,7 +44,11 @@ struct PrefixedIo {
 }
 
 impl AsyncRead for PrefixedIo {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         if self.offset < self.prefix.len() && buf.remaining() > 0 {
             let count = (self.prefix.len() - self.offset).min(buf.remaining());
             buf.put_slice(&self.prefix[self.offset..self.offset + count]);
@@ -42,7 +60,11 @@ impl AsyncRead for PrefixedIo {
 }
 
 impl AsyncWrite for PrefixedIo {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.io).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
