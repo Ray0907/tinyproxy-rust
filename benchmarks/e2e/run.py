@@ -116,9 +116,9 @@ def main() -> None:
             port = 18889 if impl.endswith("-tls") else 18888
             common = f"Listen 127.0.0.1\nPort {port}\nTimeout 60\nMaxClients 1024\nAllow 127.0.0.1\nConnectPort 18081\n"
             if impl == "c":
-                # Default stdout is captured below. Tinyproxy's safe file opener
-                # rejects /dev/null as a non-regular log file.
-                content = common + "LogLevel Critical\nPidFile /tmp/tinyproxy-benchmark.pid\n"
+                # Foreground: capture stdout. No optional file-path directives
+                # (C requires quoted file paths and regular log files).
+                content = common + "LogLevel Critical\n"
             else:
                 content = common + "LogLevel Off\nShutdownTimeout 1\nMaxInflightRequests 1024\nMaxConcurrentStreams 32\n"
                 content += f"TLSCert {cert}\nTLSKey {key}\nHTTP2 Yes\n" if impl.endswith("-tls") else "AllowH2C Yes\n"
@@ -144,6 +144,19 @@ def main() -> None:
         origin = subprocess.Popen(["taskset", "-c", str(origin_cpu), args.driver, "-mode=origin"], env=env, stdout=origin_log, stderr=origin_log)
         try:
             ready(18080, origin)
+            modes = [("c", "h1"), ("rust", "h1"), ("rust", "h2c"), ("rust-tls", "h2tls")]
+            if args.rust_nodelay:
+                modes += [("rust-nodelay", "h2c"), ("rust-nodelay-tls", "h2tls")]
+            for impl, proto in modes:
+                with service(impl, f"preflight-{impl}-{proto}"):
+                    port = 18889 if impl.endswith("-tls") else 18888
+                    completed = subprocess.run([args.driver, f"-protocol={proto}", f"-proxy=127.0.0.1:{port}",
+                                                f"-ca={cert}", "-c=1", "-connections=1", "-duration=200ms", "-warmup=0s"],
+                                               env=env, capture_output=True, text=True, timeout=15, check=True)
+                    result = json.loads(completed.stdout)
+                    if result["errors"] or not result["success"]:
+                        raise RuntimeError(f"preflight failed {impl}/{proto}: {result}")
+                    print(f"PREFLIGHT {impl}/{proto}: validated responses={result['success']}, errors=0", flush=True)
             cases = []
             def case(name, impl, proto="h1", c=32, size=1024, method="GET", fresh=False, kind="http"):
                 cases.append(dict(name=name, impl=impl, protocol=proto, c=c, size=size, method=method, fresh=fresh, kind=kind))
