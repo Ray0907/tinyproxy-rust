@@ -25,7 +25,10 @@ def snapshot(pid: int) -> dict[str, float]:
         return {"cpu_seconds": (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK"),
                 "rss_mib": int(status.get("VmRSS", "0 kB").split()[0]) / 1024,
                 "threads": int(status.get("Threads", "0")), "fds": len(list((root / "fd").iterdir()))}
-    except (FileNotFoundError, ProcessLookupError):
+    except OSError:
+        # poll() and /proc reads are not atomic. An exiting process may deny
+        # fd inspection before its procfs directory disappears. Skip only this
+        # resource sample; the driver's request/error accounting is separate.
         return {}
 
 
@@ -286,7 +289,7 @@ def main() -> None:
                      "| Case | req/s | req/s range | MiB/s | p50 ms | p99 ms | errors | proxy RSS MiB | proxy CPU % |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
             for x in summary:
                 lines.append(f"| {x['case']} | {x['rps']:.1f} | {x['rps_min']:.1f}–{x['rps_max']:.1f} | {x['mib_s']:.1f} | {x['p50_ms']:.3f} | {x['p99_ms']:.3f} | {x['errors_total']} | {x['proxy_peak_rss_mib']:.2f} | {x['proxy_cpu_pct']:.1f} |")
-            lines += ["", "## Held CONNECT tunnels", "", "Idle cases are one observation, not repeated or a leak/soak certification.", "", "| Case | Established | TCP connections | RSS MiB | threads | FDs | idle CPU % | FDs after close |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+            lines += ["", "## Held CONNECT tunnels", "", "Idle cases are one observation, not repeated or a leak/soak certification.", "", "| Case | Established | TCP connections | RSS MiB | threads | FDs | idle CPU % | FDs after close |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
             for x in idle:
                 s = x["occupied"]
                 lines.append(f"| {x['case']} | {x['ready_idle']} | {x['tcp_connections']} | {s['rss_mib']:.2f} | {s['threads']} | {s['fds']} | {x['idle_cpu_pct']:.2f} | {x['after_close']['fds']} |")
