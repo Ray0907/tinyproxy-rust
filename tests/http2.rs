@@ -82,10 +82,11 @@ impl Client {
     }
     async fn send(
         &self,
-        request: Request<()>,
+        mut request: Request<()>,
         end: bool,
     ) -> Result<(h2::client::ResponseFuture, h2::SendStream<Bytes>)> {
         let mut sender = timeout(WAIT, self.sender.clone().ready()).await??;
+        *request.version_mut() = Version::HTTP_2;
         Ok(sender.send_request(request, end)?)
     }
     async fn get(&self, uri: String) -> Result<Response<h2::RecvStream>> {
@@ -607,18 +608,25 @@ async fn max_concurrent_streams_is_advertised_and_enforced() -> Result<()> {
     config.max_concurrent_streams = 1;
     config.connect_ports = vec![target.port()];
     let proxy = Proxy::new(config).await?;
+    let origin = Origin::new("after-capacity").await?;
     let client = Client::plain(&proxy).await?;
     let (mut send, recv) = client.tunnel(target).await?;
     let (_upstream, _) = timeout(WAIT, listener.accept()).await??;
-    // Server settings have arrived by the successful CONNECT response.
-    assert!(
-        timeout(Duration::from_millis(100), client.sender.clone().ready())
-            .await
-            .is_err()
-    );
+    assert_eq!(client.sender.current_max_send_streams(), 1);
+    // h2 allows a pending request to be created; ready() alone is not
+    // proof of an available wire stream. Assert observable dispatch.
+    let request = Request::builder().uri(origin.url("/")).body(())?;
+    let (mut response, _) = client.send(request, true).await?;
+    assert!(timeout(Duration::from_millis(100), &mut response)
+        .await
+        .is_err());
+    assert_eq!(proxy.metrics.requests.load(Ordering::Relaxed), 1);
     send.send_reset(h2::Reason::CANCEL);
     drop(recv);
-    timeout(WAIT, client.sender.clone().ready()).await??;
+    assert_eq!(
+        collect(timeout(WAIT, response).await??.into_body()).await?,
+        b"after-capacity"
+    );
     drop(client);
     proxy.stop().await
 }
@@ -727,5 +735,30 @@ fn tls_paths_resolve_relative_to_configuration() -> Result<()> {
         config.tls_key.as_deref(),
         directory.path().join("key.pem").to_str()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn h2_reset_after_half_close_releases_idle_upstream() -> Result<()> {
+    for reason in [h2::Reason::CANCEL, h2::Reason::NO_ERROR] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let target = listener.local_addr()?;
+        let mut config = config();
+        config.connect_ports = vec![target.port()];
+        let proxy = Proxy::new(config).await?;
+        let client = Client::plain(&proxy).await?;
+        let (mut send, recv) = client.tunnel(target).await?;
+        let (mut upstream, _) = timeout(WAIT, listener.accept()).await??;
+        send.send_data(Bytes::new(), true)?;
+        assert!(timeout(WAIT, upstream.read_u8()).await?.is_err());
+        // Normal END_STREAM must retain the response direction.
+        assert_eq!(proxy.metrics.inflight.load(Ordering::Relaxed), 1);
+        send.send_reset(reason);
+        drop(recv);
+        // Do NOT close the idle upstream: reset itself must free it.
+        inflight(&proxy, 0).await?;
+        drop(client);
+        proxy.stop().await?;
+    }
     Ok(())
 }

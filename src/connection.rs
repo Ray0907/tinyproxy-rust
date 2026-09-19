@@ -279,7 +279,11 @@ async fn forward(
                 let mut client =
                     ActivityIo::new(TokioIo::new(upgraded), state.activity.clone(), None);
                 let mut target = ActivityIo::new(target_stream, state.activity.clone(), None);
-                copy_bidirectional(&mut client, &mut target).await?;
+                if version == Version::HTTP_2 {
+                    crate::h2_tunnel::relay(client, target).await?;
+                } else {
+                    copy_bidirectional(&mut client, &mut target).await?;
+                }
                 Ok::<_, BoxError>(())
             };
             tokio::select! {
