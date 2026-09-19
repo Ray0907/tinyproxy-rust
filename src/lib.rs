@@ -6,6 +6,7 @@ pub mod config;
 pub mod connection;
 mod exchange;
 pub mod filter;
+mod h2_tunnel;
 mod protocol;
 pub mod runtime;
 pub mod server;

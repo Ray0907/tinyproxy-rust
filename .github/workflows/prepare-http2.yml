@@ -2,9 +2,12 @@ name: Prepare HTTP2 branch
 on:
   push:
     branches: [feat/http2-proxy]
-    paths: [Cargo.toml, src/**, tests/**]
+    paths: [Cargo.toml, src/**, tests/**, .github/workflows/prepare-http2.yml]
 permissions:
   contents: write
+concurrency:
+  group: prepare-http2
+  cancel-in-progress: true
 jobs:
   prepare:
     if: github.ref == 'refs/heads/feat/http2-proxy'
@@ -15,15 +18,95 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Normalize source and lock dependencies on this feature branch only
+      - name: Apply reviewed reset integration and regression corrections
         run: |
-          cargo generate-lockfile
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/connection.rs')
+          s = p.read_text()
+          old = 'copy_bidirectional(&mut client, &mut target).await?;'
+          if 'crate::h2_tunnel::relay' not in s:
+              assert s.count(old) == 1
+              s = s.replace(old, '''if version == Version::HTTP_2 {
+                          crate::h2_tunnel::relay(client, target).await?;
+                      } else {
+                          copy_bidirectional(&mut client, &mut target).await?;
+                      }''')
+              p.write_text(s)
+          p = Path('tests/http2.rs')
+          s = p.read_text()
+          old = '        request: Request<()>,\n        end: bool,'
+          if old in s:
+              s = s.replace(old, '        mut request: Request<()>,\n        end: bool,')
+              old = '        Ok(sender.send_request(request, end)?)'
+              assert s.count(old) == 1
+              s = s.replace(old, '        *request.version_mut() = Version::HTTP_2;\n' + old)
+          begin = s.index('#[tokio::test]\nasync fn max_concurrent_streams_is_advertised_and_enforced')
+          end = s.index('#[tokio::test]', begin + 1)
+          s = s[:begin] + '''#[tokio::test]
+          async fn max_concurrent_streams_is_advertised_and_enforced() -> Result<()> {
+              let listener = TcpListener::bind("127.0.0.1:0").await?;
+              let target = listener.local_addr()?;
+              let mut config = config();
+              config.max_concurrent_streams = 1;
+              config.connect_ports = vec![target.port()];
+              let proxy = Proxy::new(config).await?;
+              let origin = Origin::new("after-capacity").await?;
+              let client = Client::plain(&proxy).await?;
+              let (mut send, recv) = client.tunnel(target).await?;
+              let (_upstream, _) = timeout(WAIT, listener.accept()).await??;
+              assert_eq!(client.sender.current_max_send_streams(), 1);
+              // h2 allows a pending request to be created; ready() alone is not
+              // proof of an available wire stream. Assert observable dispatch.
+              let request = Request::builder().uri(origin.url("/")).body(())?;
+              let (mut response, _) = client.send(request, true).await?;
+              assert!(timeout(Duration::from_millis(100), &mut response).await.is_err());
+              assert_eq!(proxy.metrics.requests.load(Ordering::Relaxed), 1);
+              send.send_reset(h2::Reason::CANCEL);
+              drop(recv);
+              assert_eq!(collect(timeout(WAIT, response).await??.into_body()).await?, b"after-capacity");
+              drop(client);
+              proxy.stop().await
+          }
+
+          ''' + s[end:]
+          if 'h2_reset_after_half_close_releases_idle_upstream' not in s:
+              s += '''
+          #[tokio::test]
+          async fn h2_reset_after_half_close_releases_idle_upstream() -> Result<()> {
+              for reason in [h2::Reason::CANCEL, h2::Reason::NO_ERROR] {
+                  let listener = TcpListener::bind("127.0.0.1:0").await?;
+                  let target = listener.local_addr()?;
+                  let mut config = config();
+                  config.connect_ports = vec![target.port()];
+                  let proxy = Proxy::new(config).await?;
+                  let client = Client::plain(&proxy).await?;
+                  let (mut send, recv) = client.tunnel(target).await?;
+                  let (mut upstream, _) = timeout(WAIT, listener.accept()).await??;
+                  send.send_data(Bytes::new(), true)?;
+                  assert!(timeout(WAIT, upstream.read_u8()).await?.is_err());
+                  // Normal END_STREAM must retain the response direction.
+                  assert_eq!(proxy.metrics.inflight.load(Ordering::Relaxed), 1);
+                  send.send_reset(reason);
+                  drop(recv);
+                  // Do NOT close the idle upstream: reset itself must free it.
+                  inflight(&proxy, 0).await?;
+                  drop(client);
+                  proxy.stop().await?;
+              }
+              Ok(())
+          }
+          '''
+          p.write_text(s)
+          PY
+      - name: Normalize and commit only reviewed source files on the feature branch
+        run: |
           cargo fmt --all
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Cargo.lock src tests
+          git add src tests
           if ! git diff --cached --quiet; then
-            git commit -m 'build: lock HTTP2 TLS dependencies and format sources'
+            git commit -m 'fix: release reset H2 tunnels and verify stream capacity on the wire'
             git push origin HEAD:feat/http2-proxy
           fi
       - run: cargo test --all-targets --locked
