@@ -1,415 +1,407 @@
-use crate::acl::AccessControl;
-use crate::auth::Authenticator;
-use crate::config::Config;
-use crate::error::{ProxyError, ProxyResult};
-use crate::filter::Filter;
-use crate::stats::Stats;
-use crate::utils::{copy_bidirectional, parse_http_request, HttpRequest};
-
-use bytes::BytesMut;
-use log::{debug, warn};
+use crate::runtime::{ConnectionGuard, Runtime};
+use crate::transport::{self, Activity, ActivityIo};
+use anyhow::Result;
+use bytes::Bytes;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::header::{
+    HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, PROXY_AUTHENTICATE, VIA,
+};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use std::convert::Infallible;
+use std::error::Error;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{copy_bidirectional, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
-use tokio::time::{timeout, Duration};
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
-pub struct ConnectionHandler {
-    stream: TcpStream,
-    client_addr: SocketAddr,
-    config: Arc<Config>,
-    stats: Arc<RwLock<Stats>>,
-    acl: AccessControl,
-    auth: Authenticator,
-    filter: Filter,
+type BoxError = Box<dyn Error + Send + Sync>;
+type Body = UnsyncBoxBody<Bytes, BoxError>;
+type HttpResult<T> = std::result::Result<T, (StatusCode, &'static str)>;
+
+struct Context {
+    runtime: Arc<Runtime>,
+    guard: Arc<ConnectionGuard>,
+    activity: Activity,
+    cancelled: CancellationToken,
+    upgraded: AtomicBool,
 }
 
-impl ConnectionHandler {
-    pub fn new(
-        stream: TcpStream,
-        client_addr: SocketAddr,
-        config: Arc<Config>,
-        stats: Arc<RwLock<Stats>>,
-    ) -> Self {
-        let acl = AccessControl::new(&config);
-        let auth = Authenticator::new(&config);
-        let filter = Filter::new(&config);
-
-        Self {
-            stream,
-            client_addr,
-            config,
-            stats,
-            acl,
-            auth,
-            filter,
-        }
-    }
-
-    pub async fn handle(mut self) -> ProxyResult<()> {
-        debug!("Handling connection from {}", self.client_addr);
-
-        // Check access control
-        if !self.acl.is_allowed(&self.client_addr) {
-            warn!("Access denied for {}", self.client_addr);
-            self.send_error_response(403, "Forbidden").await?;
-            return Err(ProxyError::AccessDenied(format!(
-                "IP {} is not allowed",
-                self.client_addr.ip()
-            )));
-        }
-
-        // Read the initial request
-        let mut buffer = BytesMut::with_capacity(self.config.buffer_size);
-        let mut total_read = 0;
-
-        loop {
-            let timeout_duration = Duration::from_secs(self.config.timeout);
-            let n = timeout(timeout_duration, self.stream.read_buf(&mut buffer))
-                .await
-                .map_err(|_| ProxyError::Timeout)?
-                .map_err(ProxyError::Io)?;
-
-            if n == 0 {
-                if total_read == 0 {
-                    debug!("Client closed connection before sending any data");
-                    return Ok(());
-                }
-                break;
-            }
-
-            total_read += n;
-
-            // Check if we have a complete HTTP request
-            if let Some(end_of_headers) = find_end_of_headers(&buffer) {
-                let request_data = buffer.split_to(end_of_headers + 4); // +4 for \r\n\r\n
-                let request = parse_http_request(&request_data)?;
-
-                return self.handle_request(request, buffer).await;
-            }
-
-            // Prevent buffer from growing too large
-            if buffer.len() > 16384 {
-                return Err(ProxyError::InvalidRequest(
-                    "Request headers too large".to_string(),
-                ));
-            }
-        }
-
-        Err(ProxyError::InvalidRequest("Incomplete request".to_string()))
-    }
-
-    async fn handle_request(
-        &mut self,
-        request: HttpRequest,
-        remaining_data: BytesMut,
-    ) -> ProxyResult<()> {
-        debug!(
-            "Processing {} {} HTTP/{}",
-            request.method, request.uri, request.version
-        );
-
-        // Update stats
-        {
-            let mut stats = self.stats.write().await;
-            stats.requests_processed += 1;
-        }
-
-        // Check authentication if required
-        if let Some(_) = &self.config.basic_auth {
-            if !self.auth.authenticate(&request)? {
-                self.send_proxy_auth_required().await?;
-                return Err(ProxyError::AuthenticationFailed);
-            }
-        }
-
-        // Check for statistics request
-        if let Some(stat_host) = &self.config.stat_host {
-            let host_header = request.headers.get("host").unwrap_or(&request.uri);
-            if host_header.contains(stat_host) {
-                return self.handle_stats_request().await;
-            }
-        }
-
-        // Apply filters
-        if self.config.filter_urls && !self.filter.is_allowed(&request.uri)? {
-            warn!("Request blocked by filter: {}", request.uri);
-            self.send_error_response(403, "Forbidden by filter").await?;
-            return Err(ProxyError::FilterBlocked(request.uri.clone()));
-        }
-
-        // Handle different request methods
-        match request.method.as_str() {
-            "CONNECT" => self.handle_connect_request(request).await,
-            "GET" | "POST" | "PUT" | "DELETE" | "HEAD" | "OPTIONS" | "PATCH" => {
-                self.handle_http_request(request, remaining_data).await
-            }
-            _ => {
-                self.send_error_response(405, "Method Not Allowed").await?;
-                Err(ProxyError::InvalidRequest(format!(
-                    "Unsupported method: {}",
-                    request.method
-                )))
-            }
-        }
-    }
-
-    async fn handle_connect_request(&mut self, request: HttpRequest) -> ProxyResult<()> {
-        debug!("Handling CONNECT request to {}", request.uri);
-
-        // Parse the target host and port
-        let (host, port) = parse_host_port(&request.uri)?;
-
-        // Check if the port is allowed for CONNECT requests
-        if !self.config.connect_ports.contains(&port) {
-            warn!("CONNECT to port {} not allowed", port);
-            self.send_error_response(403, "Port not allowed").await?;
-            return Err(ProxyError::AccessDenied(format!(
-                "CONNECT to port {} is not allowed",
-                port
-            )));
-        }
-
-        // Connect to the target server
-        let target_addr = format!("{}:{}", host, port);
-        let target_stream = timeout(Duration::from_secs(30), TcpStream::connect(&target_addr))
-            .await
-            .map_err(|_| ProxyError::Timeout)?
-            .map_err(|e| {
-                ProxyError::Upstream(format!("Failed to connect to {}: {}", target_addr, e))
-            })?;
-
-        debug!("Connected to {}", target_addr);
-
-        // Send 200 Connection Established response
-        let response = b"HTTP/1.1 200 Connection established\r\n\r\n";
-        self.stream
-            .write_all(response)
-            .await
-            .map_err(ProxyError::Io)?;
-
-        // Start bidirectional copying
-        let (client_read, client_write) = self.stream.split();
-        let (target_read, target_write) = target_stream.into_split();
-
-        let bytes_transferred =
-            copy_bidirectional(client_read, target_write, target_read, client_write).await?;
-
-        debug!(
-            "CONNECT tunnel closed, transferred {} bytes",
-            bytes_transferred
-        );
-
-        // Update stats
-        {
-            let mut stats = self.stats.write().await;
-            stats.bytes_transferred += bytes_transferred;
-        }
-
-        Ok(())
-    }
-
-    async fn handle_http_request(
-        &mut self,
-        request: HttpRequest,
-        remaining_data: BytesMut,
-    ) -> ProxyResult<()> {
-        debug!("Handling HTTP request to {}", request.uri);
-
-        // Handle both absolute and relative URLs
-        let (host, port, target_uri) = if request.uri.starts_with("http://") || request.uri.starts_with("https://") {
-            // Absolute URL
-            let url = url::Url::parse(&request.uri)
-                .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URL: {}", e)))?;
-            
-            let host = url.host_str()
-                .ok_or_else(|| ProxyError::InvalidRequest("No host in URL".to_string()))?;
-            let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
-            
-            (host.to_string(), port, request.uri.clone())
-        } else {
-            // Relative URL - extract host from Host header
-            let host = request.headers.get("host")
-                .ok_or_else(|| ProxyError::InvalidRequest("No Host header for relative URL".to_string()))?;
-            
-            // Parse host:port
-            let (hostname, port) = if let Some(colon_pos) = host.rfind(':') {
-                let hostname = &host[..colon_pos];
-                let port_str = &host[colon_pos + 1..];
-                let port = port_str.parse::<u16>()
-                    .map_err(|_| ProxyError::InvalidRequest(format!("Invalid port in Host header: {}", port_str)))?;
-                (hostname.to_string(), port)
-            } else {
-                (host.clone(), 80)
-            };
-            
-            // Construct absolute URL for upstream
-            let target_uri = format!("http://{}:{}{}", hostname, port, request.uri);
-            (hostname, port, target_uri)
-        };
-
-        // Connect to the target server
-        let target_addr = format!("{}:{}", host, port);
-        let mut target_stream = timeout(Duration::from_secs(30), TcpStream::connect(&target_addr))
-            .await
-            .map_err(|_| ProxyError::Timeout)?
-            .map_err(|e| {
-                ProxyError::Upstream(format!("Failed to connect to {}: {}", target_addr, e))
-            })?;
-
-        debug!("Connected to {}", target_addr);
-
-        // Reconstruct and send the HTTP request
-        let mut request_data = reconstruct_http_request(&request, &target_uri);
-        if !remaining_data.is_empty() {
-            request_data.extend_from_slice(&remaining_data);
-        }
-
-        target_stream
-            .write_all(&request_data)
-            .await
-            .map_err(ProxyError::Io)?;
-
-        // Start relaying data between client and server
-        let (client_read, client_write) = self.stream.split();
-        let (target_read, target_write) = target_stream.into_split();
-
-        let bytes_transferred =
-            copy_bidirectional(client_read, target_write, target_read, client_write).await?;
-
-        debug!(
-            "HTTP request completed, transferred {} bytes",
-            bytes_transferred
-        );
-
-        // Update stats
-        {
-            let mut stats = self.stats.write().await;
-            stats.bytes_transferred += bytes_transferred;
-        }
-
-        Ok(())
-    }
-
-    async fn send_error_response(&mut self, status_code: u16, reason: &str) -> ProxyResult<()> {
-        let response = format!(
-            "HTTP/1.1 {} {}\r\n\
-             Content-Type: text/html\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             \r\n\
-             <html><body><h1>{} {}</h1></body></html>",
-            status_code,
-            reason,
-            reason.len() + 32, // Approximate HTML length
-            status_code,
-            reason
-        );
-
-        self.stream
-            .write_all(response.as_bytes())
-            .await
-            .map_err(ProxyError::Io)?;
-        Ok(())
-    }
-
-    async fn send_proxy_auth_required(&mut self) -> ProxyResult<()> {
-        let response = b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                        Proxy-Authenticate: Basic realm=\"Tinyproxy\"\r\n\
-                        Content-Type: text/html\r\n\
-                        Content-Length: 72\r\n\
-                        Connection: close\r\n\
-                        \r\n\
-                        <html><body><h1>407 Proxy Authentication Required</h1></body></html>";
-
-        self.stream
-            .write_all(response)
-            .await
-            .map_err(ProxyError::Io)?;
-        Ok(())
-    }
-
-    async fn handle_stats_request(&mut self) -> ProxyResult<()> {
-        debug!("Handling statistics request");
-
-        // Get current statistics
-        let stats = self.stats.read().await;
-        let stats_html = stats.to_html();
-
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/html; charset=utf-8\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\
-             Cache-Control: no-cache\r\n\
-             \r\n\
-             {}",
-            stats_html.len(),
-            stats_html
-        );
-
-        self.stream
-            .write_all(response.as_bytes())
-            .await
-            .map_err(ProxyError::Io)?;
-
-        Ok(())
-    }
-}
-
-fn find_end_of_headers(buffer: &[u8]) -> Option<usize> {
-    for i in 0..buffer.len().saturating_sub(3) {
-        if &buffer[i..i + 4] == b"\r\n\r\n" {
-            return Some(i);
-        }
-    }
-    None
-}
-
-fn parse_host_port(uri: &str) -> ProxyResult<(String, u16)> {
-    let parts: Vec<&str> = uri.split(':').collect();
-    match parts.len() {
-        1 => Ok((parts[0].to_string(), 80)),
-        2 => {
-            let port = parts[1]
-                .parse::<u16>()
-                .map_err(|_| ProxyError::InvalidRequest(format!("Invalid port: {}", parts[1])))?;
-            Ok((parts[0].to_string(), port))
-        }
-        _ => Err(ProxyError::InvalidRequest(format!(
-            "Invalid host:port format: {}",
-            uri
-        ))),
-    }
-}
-
-fn reconstruct_http_request(request: &HttpRequest, target_uri: &str) -> Vec<u8> {
-    let mut data = Vec::new();
-
-    // Request line - use the target URI for absolute URLs
-    let uri_to_use = if target_uri.starts_with("http://") || target_uri.starts_with("https://") {
-        // For absolute URLs, use the original relative path
-        &request.uri
-    } else {
-        target_uri
-    };
-    
-    data.extend_from_slice(
-        format!(
-            "{} {} HTTP/{}\r\n",
-            request.method, uri_to_use, request.version
+pub async fn serve(
+    mut stream: TcpStream,
+    address: SocketAddr,
+    runtime: Arc<Runtime>,
+    guard: Arc<ConnectionGuard>,
+) -> Result<()> {
+    if !runtime.acl.is_allowed(address.ip()) {
+        runtime.metrics.rejected.fetch_add(1, Ordering::Relaxed);
+        let _ = timeout(
+            Duration::from_secs(2),
+            stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            ),
         )
-        .as_bytes(),
-    );
-
-    // Headers
-    for (name, value) in &request.headers {
-        data.extend_from_slice(format!("{}: {}\r\n", name, value).as_bytes());
+        .await;
+        return Ok(());
     }
+    let activity = Activity::new(Duration::from_secs(runtime.config.timeout));
+    let io = TokioIo::new(ActivityIo::new(
+        stream,
+        activity.clone(),
+        Some(runtime.metrics.clone()),
+    ));
+    let context = Arc::new(Context {
+        runtime: runtime.clone(),
+        guard,
+        activity,
+        cancelled: CancellationToken::new(),
+        upgraded: AtomicBool::new(false),
+    });
+    let service_context = context.clone();
+    let service = service_fn(move |request| {
+        let context = service_context.clone();
+        async move {
+            let response = match handle(request, context).await {
+                Ok(response) => response,
+                Err((status, message)) => error_response(status, message),
+            };
+            Ok::<_, Infallible>(response)
+        }
+    });
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(runtime.config.header_timeout))
+        .max_buf_size(16 * 1024)
+        .half_close(true);
+    let connection = builder.serve_connection(io, service).with_upgrades();
+    tokio::pin!(connection);
+    let result = tokio::select! {
+        result = &mut connection => result.map_err(Into::into),
+        _ = context.activity.expired() => Ok(()),
+        _ = runtime.force_shutdown.cancelled() => Ok(()),
+        _ = runtime.shutdown.cancelled() => {
+            connection.as_mut().graceful_shutdown();
+            tokio::select! {
+                result = &mut connection => result.map_err(Into::into),
+                _ = context.activity.expired() => Ok(()),
+                _ = runtime.force_shutdown.cancelled() => Ok(()),
+            }
+        }
+    };
+    if !context.upgraded.load(Ordering::Relaxed) {
+        context.cancelled.cancel();
+    }
+    result
+}
 
-    // End of headers
-    data.extend_from_slice(b"\r\n");
+async fn handle(
+    mut request: Request<Incoming>,
+    context: Arc<Context>,
+) -> HttpResult<Response<Body>> {
+    let runtime = &context.runtime;
+    runtime.metrics.requests.fetch_add(1, Ordering::Relaxed);
+    if !runtime.auth.authenticate(request.headers()) {
+        runtime
+            .metrics
+            .auth_failures
+            .fetch_add(1, Ordering::Relaxed);
+        return Err((
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "Proxy authentication required",
+        ));
+    }
+    let target = Target::parse(&request).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let is_connect = request.method() == Method::CONNECT;
+    if !runtime
+        .filter
+        .is_allowed(&target.host, &target.url, is_connect)
+    {
+        return Err((StatusCode::FORBIDDEN, "Blocked by filter"));
+    }
+    if !is_connect && runtime.config.stat_host.as_deref() == Some(target.host.as_str()) {
+        if request.method() != Method::GET && request.method() != Method::HEAD {
+            return Err((
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Statistics require GET or HEAD",
+            ));
+        }
+        return Ok(text_response(
+            StatusCode::OK,
+            runtime.metrics.to_html(),
+            "text/html; charset=utf-8",
+        ));
+    }
+    if is_connect {
+        if !runtime.config.connect_ports.contains(&target.port) {
+            return Err((StatusCode::FORBIDDEN, "CONNECT port not allowed"));
+        }
+        // Validate hop-by-hop syntax before switching protocols.
+        strip_hop_by_hop(request.headers_mut())
+            .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+        let target_stream = dial(&target, runtime).await?;
+        let upgrade = hyper::upgrade::on(&mut request);
+        context.upgraded.store(true, Ordering::Relaxed);
+        let tunnel_context = context.clone();
+        runtime.tasks.spawn(async move {
+            let context = tunnel_context;
+            let tunnel = async {
+                let upgraded = upgrade.await?;
+                let mut client = TokioIo::new(upgraded);
+                let mut target = ActivityIo::new(target_stream, context.activity.clone(), None);
+                // Hyper's upgrade preserves bytes read beyond the CONNECT header.
+                // Tokio preserves half-close and finishes the remaining direction.
+                copy_bidirectional(&mut client, &mut target).await?;
+                Ok::<_, BoxError>(())
+            };
+            tokio::select! {
+                _ = tunnel => {},
+                _ = context.activity.expired() => {},
+                _ = context.runtime.force_shutdown.cancelled() => {},
+            }
+            context.cancelled.cancel();
+        });
+        let mut response = text_response(StatusCode::OK, String::new(), "text/plain");
+        response.headers_mut().remove("content-length");
+        response.headers_mut().remove("content-type");
+        return Ok(response);
+    }
+    if request.headers().contains_key("upgrade") {
+        return Err((StatusCode::NOT_IMPLEMENTED, "HTTP Upgrade is not supported"));
+    }
+    strip_hop_by_hop(request.headers_mut())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let target_stream = dial(&target, runtime).await?;
+    request.headers_mut().insert(HOST, target.authority);
+    add_via(request.headers_mut(), runtime);
+    *request.uri_mut() = target.path;
+    *request.version_mut() = Version::HTTP_11;
 
-    data
+    let io = TokioIo::new(ActivityIo::new(
+        target_stream,
+        context.activity.clone(),
+        None,
+    ));
+    let (mut sender, connection) = hyper::client::conn::http1::handshake(io)
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream handshake failed"))?;
+    let driver_context = context.clone();
+    runtime.tasks.spawn(async move {
+        // Keep the connection permit until this socket has also been released.
+        let _guard = driver_context.guard.clone();
+        tokio::select! {
+            _ = connection => {},
+            _ = driver_context.activity.expired() => {},
+            _ = driver_context.cancelled.cancelled() => {},
+            _ = driver_context.runtime.force_shutdown.cancelled() => {},
+        }
+    });
+    let mut response = sender
+        .send_request(request)
+        .await
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "Upstream request failed"))?;
+    if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+        return Err((StatusCode::BAD_GATEWAY, "Unexpected upstream upgrade"));
+    }
+    strip_hop_by_hop(response.headers_mut())
+        .map_err(|message| (StatusCode::BAD_GATEWAY, message))?;
+    add_via(response.headers_mut(), runtime);
+    Ok(response.map(|body| {
+        body.map_err(|error| -> BoxError { Box::new(error) })
+            .boxed_unsync()
+    }))
+}
+
+async fn dial(target: &Target, runtime: &Runtime) -> HttpResult<TcpStream> {
+    transport::connect(
+        &target.host,
+        target.port,
+        runtime.config.bind_address,
+        runtime.config.connect_timeout,
+    )
+    .await
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::TimedOut {
+            (StatusCode::GATEWAY_TIMEOUT, "Upstream connection timed out")
+        } else {
+            (StatusCode::BAD_GATEWAY, "Upstream connection failed")
+        }
+    })
+}
+
+struct Target {
+    host: String,
+    port: u16,
+    authority: HeaderValue,
+    path: Uri,
+    url: String,
+}
+
+impl Target {
+    fn parse<B>(request: &Request<B>) -> std::result::Result<Self, &'static str> {
+        let connect = request.method() == Method::CONNECT;
+        let uri = request.uri();
+        if connect && (uri.scheme().is_some() || uri.path_and_query().is_some()) {
+            return Err("CONNECT requires host:port authority form");
+        }
+        if uri
+            .scheme_str()
+            .is_some_and(|scheme| !scheme.eq_ignore_ascii_case("http"))
+        {
+            return Err("Use CONNECT for HTTPS destinations");
+        }
+        if request.headers().get_all(HOST).iter().count() > 1 {
+            return Err("Multiple Host headers are not allowed");
+        }
+        let authority = if let Some(authority) = uri.authority() {
+            authority.clone()
+        } else {
+            if connect {
+                return Err("CONNECT requires an authority");
+            }
+            request
+                .headers()
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+                .ok_or("Host header required")?
+                .parse::<hyper::http::uri::Authority>()
+                .map_err(|_| "Invalid Host header")?
+        };
+        if authority.as_str().contains('@') || authority.host().is_empty() {
+            return Err("Invalid destination authority");
+        }
+        let raw = authority.as_str();
+        let explicit_port = raw
+            .rsplit_once(':')
+            .filter(|(before, _)| !raw.starts_with('[') || before.ends_with(']'));
+        let port = if let Some((_, port)) = explicit_port {
+            port.parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or("Invalid destination port")?
+        } else if connect {
+            return Err("CONNECT requires an explicit port");
+        } else {
+            80
+        };
+        let host = authority
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if host.is_empty() {
+            return Err("Empty destination host");
+        }
+        let path = uri
+            .path_and_query()
+            .map(|path| path.as_str())
+            .unwrap_or("/");
+        if !connect
+            && !path.starts_with('/')
+            && !(path == "*" && request.method() == Method::OPTIONS)
+        {
+            return Err("Invalid HTTP request target");
+        }
+        Ok(Self {
+            host,
+            port,
+            authority: HeaderValue::from_str(raw).map_err(|_| "Invalid authority header")?,
+            path: path.parse().map_err(|_| "Invalid request path")?,
+            url: format!("http://{}{}", raw, path),
+        })
+    }
+}
+
+fn strip_hop_by_hop(headers: &mut HeaderMap) -> std::result::Result<(), &'static str> {
+    if headers.contains_key("content-length") && headers.contains_key("transfer-encoding") {
+        return Err("Ambiguous message framing");
+    }
+    let mut nominated = Vec::new();
+    for value in headers.get_all(CONNECTION) {
+        for token in value
+            .to_str()
+            .map_err(|_| "Invalid Connection header")?
+            .split(',')
+        {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let name =
+                HeaderName::from_bytes(token.as_bytes()).map_err(|_| "Invalid Connection token")?;
+            if name == "content-length" || name == "transfer-encoding" {
+                return Err("Connection must not nominate message framing headers");
+            }
+            nominated.push(name);
+        }
+    }
+    for name in nominated {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-authenticate",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+    // Hyper decodes and re-encodes body framing. Never blindly relay raw bytes
+    // after the first HTTP request; only CONNECT uses a byte tunnel.
+    Ok(())
+}
+
+fn add_via(headers: &mut HeaderMap, runtime: &Runtime) {
+    if !runtime.config.disable_via_header {
+        let value = HeaderValue::from_str(&format!("1.1 {}", runtime.config.via_proxy_name))
+            .expect("startup-validated ViaProxyName");
+        headers.append(VIA, value);
+    }
+}
+
+fn text_response(status: StatusCode, text: String, content_type: &'static str) -> Response<Body> {
+    let length = text.len();
+    let body = Full::new(Bytes::from(text))
+        .map_err(|never| -> BoxError { match never {} })
+        .boxed_unsync();
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        "content-length",
+        HeaderValue::from_str(&length.to_string()).expect("valid length"),
+    );
+    response
+}
+
+fn error_response(status: StatusCode, message: &'static str) -> Response<Body> {
+    let mut response = text_response(
+        status,
+        format!("{}\n", message),
+        "text/plain; charset=utf-8",
+    );
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        response.headers_mut().insert(
+            PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"Tinyproxy\""),
+        );
+    }
+    response
 }
